@@ -10,5 +10,5 @@
     "skipLibCheck": true,
     "noEmit": true
   },
-  "files": ["unrot.ts"]
+  "files": ["scripts/unrot.ts"]
 }

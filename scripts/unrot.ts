@@ -4,9 +4,9 @@
  *
  *   browser login ─► sync ─► SQLite (raw API JSON) ─► process (one model call per item) ─► export ─► lists/
  *
- * Runs on Bun (https://bun.sh) with three npm packages pinned in bun.lock; ffmpeg is optional. The model
- * comes from your Claude Pro/Max or ChatGPT (Codex) subscription via OAuth, or from an OpenRouter API key.
- * Run `bun install --frozen-lockfile --production` here once, then `bun unrot.ts help`.
+ * Runs on Bun (https://bun.sh) with three npm packages pinned in the skill folder's bun.lock; ffmpeg is
+ * optional. The model comes from an OpenRouter API key or your Claude Pro/Max or ChatGPT (Codex) subscription.
+ * In the skill folder, run `bun install --frozen-lockfile --production` once, then `bun scripts/unrot.ts help`.
  */
 
 import { Database, type SQLQueryBindings } from "bun:sqlite";
@@ -21,11 +21,17 @@ import { parseArgs } from "node:util";
 import { parseHTML } from "linkedom";
 import { ClientTransaction } from "x-client-transaction-id";
 import { z } from "zod";
+import viewerHtml from "../assets/bookmarks.html" with { type: "text" };
+
+/** The X bookmarks viewer; `x export` fills in __BOOKMARKS_DATA__. */
+// bun-types types every .html import as an HTMLBundle; `type: "text"` makes it the file's text.
+const VIEWER_HTML = viewerHtml as unknown as string;
 
 // Bun's auto-install ignores bun.lock, and a parent project's node_modules (an old zod, say) can shadow
-// these packages, so only run from this folder's own install.
-if (!existsSync(join(import.meta.dir, "node_modules"))) {
-  process.stderr.write(`error: install the packages once: bun install --cwd ${import.meta.dir} --frozen-lockfile --production\n`);
+// these packages, so only run from the skill folder's own install.
+const SKILL_DIR = dirname(import.meta.dir);
+if (!existsSync(join(SKILL_DIR, "node_modules"))) {
+  process.stderr.write(`error: install the packages once: bun install --cwd ${SKILL_DIR} --frozen-lockfile --production\n`);
   process.exit(1);
 }
 
@@ -515,7 +521,7 @@ const CODEX_SCOPES = "openid profile email offline_access";
 const CODEX_API = "https://chatgpt.com/backend-api/codex";
 const CODEX_VERSION = "0.167.0"; // Codex CLI version to present; the model list depends on it
 
-/** This tool's own login (`bun unrot.ts login`), the only kind it ever refreshes. */
+/** This tool's own login (`unrot login`), the only kind it ever refreshes. */
 interface Token { access: string; refresh: string; expires: number; email?: string }
 type AuthFile = Partial<Record<"claude" | "codex", Token>>;
 /** A subscription login found on this machine. */
@@ -545,7 +551,7 @@ async function tokenRequest(provider: "claude" | "codex", body: Record<string, s
     : await fetch(CODEX_TOKEN_URL, { method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" }, body: new URLSearchParams(body), signal: AbortSignal.timeout(30_000) });
   const text = await res.text();
   if (!res.ok) {
-    const again = body.grant_type === "refresh_token" ? `; run \`bun unrot.ts login ${provider}\` again` : "";
+    const again = body.grant_type === "refresh_token" ? `; run \`unrot login ${provider}\` again` : "";
     throw new Fatal(`${provider} token request failed (HTTP ${res.status}): ${text.slice(0, 300)}${again}`);
   }
   const data: TokenReply = JSON.parse(text);
@@ -656,8 +662,8 @@ async function subscriptionLogin(provider: "claude" | "codex", rejected?: string
     const app = provider === "claude" ? "Claude Code" : "Codex CLI";
     throw new Fatal(logins.length
       ? `the ${provider} logins found (${[...new Set(logins.map((l) => l.source))].join(", ")}) have expired; use that app once so it `
-        + `refreshes its login, or run \`bun unrot.ts login ${provider}\``
-      : `no ${provider} subscription login found: log into ${app} (or oh-my-pi / pi), or run \`bun unrot.ts login ${provider}\``);
+        + `refreshes its login, or run \`unrot login ${provider}\``
+      : `no ${provider} subscription login found: log into ${app} (or oh-my-pi / pi), or run \`unrot login ${provider}\``);
   }
   if (cached?.source !== chosen.source) log(`  using the ${chosen.source} login for ${provider}`);
   loginInUse.set(provider, chosen);
@@ -670,7 +676,7 @@ async function subscriptionPost(provider: "claude" | "codex", url: string, heade
   for (let attempt = 0; ; attempt++) {
     const res = await fetch(url, { method: "POST", headers: headers(login.access), body, signal: AbortSignal.timeout(timeoutMs) });
     if (res.status !== 401) return res;
-    if (attempt) throw new Fatal(`${provider} rejected the ${login.source} login (HTTP 401); log in again there or run \`bun unrot.ts login ${provider}\``);
+    if (attempt) throw new Fatal(`${provider} rejected the ${login.source} login (HTTP 401); log in again there or run \`unrot login ${provider}\``);
     login = await subscriptionLogin(provider, login.access);
   }
 }
@@ -754,7 +760,7 @@ function claudeModel(model: string): Model {
       if (!res.ok) {
         const text = await res.text();
         if (res.status === 404 && text.includes("model")) {
-          throw new Fatal(`claude doesn't offer model "${model}" to this account; list them with \`bun unrot.ts models claude\``);
+          throw new Fatal(`claude doesn't offer model "${model}" to this account; list them with \`unrot models claude\``);
         }
         throw new HttpError(res.status, text, res.headers, "Claude");
       }
@@ -791,7 +797,7 @@ function codexModel(model: string): Model {
       if (!res.ok) {
         const text = await res.text();
         if (text.includes("model_not_found")) {
-          throw new Fatal(`codex doesn't offer model "${model}" to this account; list them with \`bun unrot.ts models codex\``);
+          throw new Fatal(`codex doesn't offer model "${model}" to this account; list them with \`unrot models codex\``);
         }
         throw new HttpError(res.status, text, res.headers, "Codex");
       }
@@ -828,7 +834,7 @@ function chooseModel(opts: { provider?: string; model?: string }): Model {
   }
   if (!provider) {
     throw new Fatal("no model access: log into Claude Code or Codex CLI (this script reuses their subscription login), run "
-      + `\`bun unrot.ts login claude\` or \`bun unrot.ts login codex\`, or put OPENROUTER_API_KEY in ${join(HOME, ".env")}`);
+      + `\`unrot login claude\` or \`unrot login codex\`, or put OPENROUTER_API_KEY in ${join(HOME, ".env")}`);
   }
   const model = opts.model ?? process.env.UNROT_MODEL ?? DEFAULT_MODELS[provider];
   return provider === "openrouter" ? openRouterModel(model) : provider === "claude" ? claudeModel(model) : codexModel(model);
@@ -943,7 +949,7 @@ async function pastedLine(): Promise<string> {
 }
 
 async function login(provider: string | undefined): Promise<void> {
-  if (provider !== "claude" && provider !== "codex") throw new Fatal("usage: bun unrot.ts login <claude|codex>");
+  if (provider !== "claude" && provider !== "codex") throw new Fatal("usage: unrot login <claude|codex>");
   const verifier = randomBytes(32).toString("base64url");
   const challenge = createHash("sha256").update(verifier).digest("base64url");
   let server: CallbackServer | undefined;
@@ -1026,7 +1032,7 @@ async function listModels(provider: string | undefined): Promise<void> {
     console.log("Any https://openrouter.ai/models model with structured outputs and image input. For Instagram, one\n"
       + "that also takes video with audio (default xiaomi/mimo-v2.6-flash) hears speech instead of reading frames.");
   } else {
-    throw new Fatal("usage: bun unrot.ts models <claude|codex|openrouter>");
+    throw new Fatal("usage: unrot models <claude|codex|openrouter>");
   }
 }
 
@@ -2161,15 +2167,17 @@ function xStatus(): void {
 
 const USAGE = `unrot: the reels and posts you saved and never went back to, sorted into lists you'll use.
 
+Run it as \`bun scripts/unrot.ts <command>\` from the skill folder; \`unrot\` below stands for that.
+
 Subscriptions: the login of Claude Code, Codex CLI, oh-my-pi or pi on this machine is reused (read-only),
 as is CLAUDE_CODE_OAUTH_TOKEN (from \`claude setup-token\`). Without one of those:
-  bun unrot.ts login <claude|codex>     log in with Claude Pro/Max or ChatGPT (browser OAuth)
-  bun unrot.ts logout <claude|codex>    forget that login
-  bun unrot.ts models <claude|codex>    models your account can use, and which login is used
-  bun unrot.ts lists                    the lists in use, as JSON (copy into lists.json to change them)
+  unrot login <claude|codex>     log in with Claude Pro/Max or ChatGPT (browser OAuth)
+  unrot logout <claude|codex>    forget that login
+  unrot models <claude|codex>    models your account can use, and which login is used
+  unrot lists                    the lists in use, as JSON (copy into lists.json to change them)
 
-  bun unrot.ts ig <command> [options]   Instagram saved posts
-  bun unrot.ts x <command> [options]    X bookmarks
+  unrot ig <command> [options]   Instagram saved posts
+  unrot x <command> [options]    X bookmarks
 
 Commands (ig and x):
   run              sync, then process, then export
@@ -2196,7 +2204,7 @@ Model (process):
 
 Data lives in ${HOME} (UNROT_HOME). Tune sorting with two files there:
   about.md     who you are and why you save things, in your words; every prompt includes it
-  lists.json   your own lists (see \`bun unrot.ts lists\`); then run \`process --redo\`
+  lists.json   your own lists (see \`unrot lists\`); then run \`process --redo\`
 Settings can go in its .env: OPENROUTER_API_KEY, UNROT_PROVIDER, UNROT_MODEL, UNROT_BROWSER`;
 
 async function main(argv: string[]): Promise<void> {
@@ -2226,7 +2234,7 @@ async function main(argv: string[]): Promise<void> {
 
   if (group === "login") return login(command);
   if (group === "logout") {
-    if (command !== "claude" && command !== "codex") throw new Fatal("usage: bun unrot.ts logout <claude|codex>");
+    if (command !== "claude" && command !== "codex") throw new Fatal("usage: unrot logout <claude|codex>");
     const auth = readAuth();
     delete auth[command];
     writeAuth(auth);
@@ -2239,7 +2247,7 @@ async function main(argv: string[]): Promise<void> {
   }
 
   const source = group === "ig" || group === "instagram" ? "ig" : group === "x" || group === "twitter" ? "x" : undefined;
-  if (!source) throw new Fatal(`unknown command "${group}"; see \`bun unrot.ts help\``);
+  if (!source) throw new Fatal(`unknown command "${group}"; see \`unrot help\``);
   const sync = source === "ig" ? igSync : xSync;
   const processItems = source === "ig" ? igProcess : xProcess;
   const exportLists = () => {
@@ -2255,303 +2263,20 @@ async function main(argv: string[]): Promise<void> {
       return exportLists();
     case "status": return source === "ig" ? igStatus() : xStatus();
     case "sql":
-      if (!arg) throw new Fatal(`usage: bun unrot.ts ${source} sql "SELECT …"`);
+      if (!arg) throw new Fatal(`usage: unrot ${source} sql "SELECT …"`);
       return sqlQuery(source === "ig" ? IG_DB : X_DB, arg);
     case "cookies-export": {
-      if (!arg) throw new Fatal(`usage: bun unrot.ts ${source} cookies-export FILE`);
+      if (!arg) throw new Fatal(`usage: unrot ${source} cookies-export FILE`);
       const domain = source === "ig" ? "instagram.com" : "x.com";
       const session = browserSession(domain, o);
       if (!session.cookies[source === "ig" ? "sessionid" : "auth_token"]) throw new Fatal(`no ${domain} login in ${session.source}`);
       writeNetscapeCookies(session.cookies, domain, arg);
-      return console.log(`wrote ${arg} (mode 600) from ${session.source}; elsewhere run: bun unrot.ts ${source} sync --cookies ${arg}`);
+      return console.log(`wrote ${arg} (mode 600) from ${session.source}; elsewhere run: unrot ${source} sync --cookies ${arg}`);
     }
     default:
-      throw new Fatal(`unknown ${source} command "${command ?? ""}"; see \`bun unrot.ts help\``);
+      throw new Fatal(`unknown ${source} command "${command ?? ""}"; see \`unrot help\``);
   }
 }
-
-// ── X bookmarks viewer (written by `x export`; data replaces __BOOKMARKS_DATA__) ─────────────────────
-
-const VIEWER_HTML = String.raw`<!doctype html>
-<html lang="en">
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>X bookmarks</title>
-<style>
-  :root { --bg: #fafaf9; --fg: #1c1917; --muted: #78716c; --line: #e7e5e4; --card: #fff; --soft: #f5f5f4;
-          --accent: #2563eb; --ok: #15803d; }
-  @media (prefers-color-scheme: dark) {
-    :root { --bg: #0c0a09; --fg: #e7e5e4; --muted: #a8a29e; --line: #292524; --card: #1c1917; --soft: #292524;
-            --accent: #60a5fa; --ok: #4ade80; }
-  }
-  * { box-sizing: border-box; }
-  [hidden] { display: none !important; }
-  body { margin: 0; background: var(--bg); color: var(--fg);
-         font: 14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
-  a { color: var(--accent); text-decoration: none; }
-  a:hover { text-decoration: underline; }
-  button { font: inherit; color: inherit; cursor: pointer; }
-  header { position: sticky; top: 0; z-index: 2; background: var(--bg); border-bottom: 1px solid var(--line);
-           padding: 12px 20px 10px; }
-  .top { display: flex; align-items: baseline; gap: 14px; flex-wrap: wrap; }
-  h1 { font-size: 18px; margin: 0; }
-  .muted { color: var(--muted); }
-  .tabs, .controls, .topics { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; margin-top: 10px; }
-  .tab { border: 1px solid var(--line); background: var(--card); border-radius: 8px; padding: 5px 11px; }
-  .tab .n { color: var(--muted); margin-left: 4px; }
-  .tab[aria-pressed="true"] { background: var(--fg); border-color: var(--fg); color: var(--bg); }
-  .tab[aria-pressed="true"] .n { color: inherit; opacity: .7; }
-  .controls { gap: 14px; }
-  input[type="search"] { flex: 1 1 260px; max-width: 420px; padding: 6px 10px; border: 1px solid var(--line);
-                         border-radius: 8px; background: var(--card); color: var(--fg); font: inherit; }
-  label { display: flex; gap: 5px; align-items: center; color: var(--muted); cursor: pointer; }
-  select, .plain { border: 1px solid var(--line); background: var(--card); color: var(--fg); font: inherit;
-                   border-radius: 8px; padding: 4px 9px; }
-  .chip { border: 1px solid var(--line); background: var(--soft); border-radius: 999px; padding: 2px 10px; font-size: 12px; }
-  .chip[aria-pressed="true"] { background: var(--accent); border-color: var(--accent); color: #fff; }
-  main { padding: 16px 20px 80px; }
-  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 14px; align-items: start; }
-  .card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; overflow: hidden;
-          display: flex; flex-direction: column; }
-  .card.is-done { opacity: .5; }
-  .media { position: relative; display: block; aspect-ratio: 16 / 10; overflow: hidden; background: var(--soft); }
-  .media img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; }
-  .badge { position: absolute; right: 8px; bottom: 8px; background: rgba(0, 0, 0, .65); color: #fff;
-           border-radius: 6px; padding: 1px 7px; font-size: 12px; }
-  .body { padding: 12px 14px; display: flex; flex-direction: column; gap: 7px; }
-  h3 { margin: 0; font-size: 15px; line-height: 1.3; overflow-wrap: anywhere; }
-  .note { margin: 0; overflow-wrap: anywhere; }
-  .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; font-size: 12px; color: var(--muted); }
-  .tag { font-size: 11px; padding: 1px 7px; border-radius: 999px; background: var(--soft); }
-  .tag.main { color: var(--fg); }
-  details { font-size: 13px; }
-  summary { cursor: pointer; color: var(--muted); font-size: 12px; }
-  .text, blockquote { white-space: pre-wrap; overflow-wrap: anywhere; margin: 6px 0 0; }
-  blockquote { padding-left: 10px; border-left: 3px solid var(--line); color: var(--muted); }
-  .actions { display: flex; justify-content: flex-end; }
-  .done { border: 1px solid var(--line); background: none; border-radius: 8px; padding: 3px 10px; font-size: 12px; }
-  .card.is-done .done { color: var(--ok); border-color: var(--ok); }
-  .empty { color: var(--muted); text-align: center; padding: 60px 0; }
-  .toast { position: fixed; left: 50%; bottom: 20px; transform: translateX(-50%); z-index: 3; display: flex; gap: 14px;
-           background: var(--fg); color: var(--bg); padding: 8px 14px; border-radius: 8px; }
-  .toast button { background: none; border: 0; text-decoration: underline; padding: 0; }
-</style>
-
-<header>
-  <div class="top">
-    <h1>X bookmarks</h1>
-    <span class="muted" id="progress"></span>
-    <span class="muted" id="generated"></span>
-  </div>
-  <nav class="tabs" id="tabs"></nav>
-  <div class="controls">
-    <input type="search" id="q" placeholder="Search titles, notes, post text, @authors   ( / )" autocomplete="off">
-    <label><input type="checkbox" id="also" checked> Include secondary reasons</label>
-    <label><input type="checkbox" id="hide-done"> Hide done</label>
-    <select id="sort" aria-label="Order">
-      <option value="new">Newest bookmark first</option>
-      <option value="old">Oldest bookmark first</option>
-    </select>
-    <button type="button" class="plain" id="mark-shown"></button>
-  </div>
-  <div class="topics" id="topics"></div>
-</header>
-<main>
-  <div class="grid" id="grid"></div>
-  <p class="empty" id="empty" hidden>Nothing matches.</p>
-</main>
-<div class="toast" id="toast" hidden></div>
-
-<script id="data" type="application/json">__BOOKMARKS_DATA__</script>
-<script>
-"use strict";
-const D = JSON.parse(document.getElementById("data").textContent);
-const DONE_KEY = "xbm:done", HIDE_KEY = "xbm:hide-done";
-const done = new Set(JSON.parse(localStorage.getItem(DONE_KEY) || "[]"));
-const state = { tab: "all", topic: "", q: "", also: true, hideDone: localStorage.getItem(HIDE_KEY) === "1", oldest: false };
-const $ = (id) => document.getElementById(id);
-const safeUrl = (u) => (/^https?:\/\//i.test(u || "") ? u : null);
-
-// Builds elements with textContent only: post text never becomes markup.
-function el(tag, props, ...kids) {
-  const e = document.createElement(tag);
-  for (const [k, v] of Object.entries(props || {})) {
-    if (v == null || v === false) continue;
-    if (k === "text") e.textContent = v;
-    else if (k === "class") e.className = v;
-    else if (k.startsWith("on")) e.addEventListener(k.slice(2), v);
-    else e.setAttribute(k, v === true ? "" : v);
-  }
-  for (const kid of kids) if (kid) e.append(kid);
-  return e;
-}
-const extLink = (url, text) => {
-  const href = safeUrl(url);
-  return href ? el("a", { href, target: "_blank", rel: "noopener noreferrer", text }) : el("span", { text });
-};
-
-function buildCard(it) {
-  const card = el("article", { class: "card" });
-  const cover = it.media[0];
-  if (cover && safeUrl(cover.thumb)) {
-    const media = el("a", { class: "media", href: safeUrl(cover.full) || safeUrl(it.url), target: "_blank",
-                            rel: "noopener noreferrer" });
-    media.append(el("img", { src: cover.thumb, loading: "lazy", alt: "", onerror: () => media.remove() }));
-    const badge = [cover.video ? "▶ video" : "", it.media.length > 1 ? "+" + (it.media.length - 1) : ""]
-      .filter(Boolean).join("  ");
-    if (badge) media.append(el("span", { class: "badge", text: badge }));
-    card.append(media);
-  }
-  const body = el("div", { class: "body" }, el("h3", { text: it.title }),
-                  it.note ? el("p", { class: "note", text: it.note }) : null);
-  const links = el("div", { class: "row" });
-  if (it.link) links.append(extLink(it.link, it.linkHost + " ↗"));
-  links.append(extLink(it.url, "@" + it.user + " · " + it.date));
-  body.append(links, el("div", { class: "row" },
-    el("span", { class: "tag main", text: D.intents[it.intent] }),
-    ...it.also.map((a) => el("span", { class: "tag", text: "also " + D.intents[a] })),
-    el("span", { class: "tag", text: D.topics[it.topic] })));
-  if (it.text || it.quoted) {
-    const details = el("details", {}, el("summary", { text: "Post text" }));
-    if (it.text) details.append(el("p", { class: "text", text: it.text }));
-    if (it.quoted) details.append(el("blockquote", { text: "@" + it.quoted.user + ": " + it.quoted.text }));
-    body.append(details);
-  }
-  const button = el("button", { type: "button", class: "done", onclick: () => toggleDone(it.id) });
-  body.append(el("div", { class: "actions" }, button));
-  card.append(body);
-  card.doneButton = button;
-  return card;
-}
-
-const cards = new Map();
-for (const it of D.items) {
-  it.hay = [it.title, it.note, it.text, it.user, it.name, it.link, it.quoted && it.quoted.user,
-            it.quoted && it.quoted.text].filter(Boolean).join("\n").toLowerCase();
-  cards.set(it.id, buildCard(it));
-}
-
-function paintDone(id) {
-  const card = cards.get(id), isDone = done.has(id);
-  card.classList.toggle("is-done", isDone);
-  card.doneButton.textContent = isDone ? "✓ Done" : "Mark done";
-}
-
-function setDone(ids, value) {
-  for (const id of ids) value ? done.add(id) : done.delete(id);
-  localStorage.setItem(DONE_KEY, JSON.stringify([...done]));
-  ids.forEach(paintDone);
-  apply();
-}
-
-function toggleDone(id) {
-  const value = !done.has(id);
-  setDone([id], value);
-  if (value) toast("Marked done", () => setDone([id], false));
-}
-
-let toastTimer;
-function toast(message, undo) {
-  const t = $("toast");
-  t.replaceChildren(el("span", { text: message }),
-                    el("button", { type: "button", text: "Undo", onclick: () => { undo(); t.hidden = true; } }));
-  t.hidden = false;
-  clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => { t.hidden = true; }, 6000);
-}
-
-function shows(it, tab, ignoreTopic) {
-  if (tab !== "all" && it.intent !== tab && !(state.also && it.also.includes(tab))) return false;
-  if (state.hideDone && done.has(it.id)) return false;
-  if (!ignoreTopic && state.topic && it.topic !== state.topic) return false;
-  return !state.q || it.hay.includes(state.q);
-}
-
-const tabs = ["all", ...Object.keys(D.intents)].map((key) => {
-  const button = el("button", { type: "button", class: "tab", onclick: () => setTab(key) },
-                    key === "all" ? "All" : D.intents[key], el("span", { class: "n" }));
-  button.dataset.tab = key;
-  $("tabs").append(button);
-  return button;
-});
-
-let shown = [];
-function apply() {
-  shown = D.items.filter((it) => shows(it, state.tab, false));
-  const visible = new Set(shown.map((it) => it.id));
-  for (const [id, card] of cards) card.hidden = !visible.has(id);
-  $("empty").hidden = shown.length > 0;
-
-  for (const button of tabs) {
-    const key = button.dataset.tab;
-    button.setAttribute("aria-pressed", String(key === state.tab));
-    button.querySelector(".n").textContent = D.items.filter((it) => shows(it, key, true)).length;
-  }
-
-  const counts = {};
-  for (const it of D.items) if (shows(it, state.tab, true)) counts[it.topic] = (counts[it.topic] || 0) + 1;
-  if (state.topic && !(state.topic in counts)) counts[state.topic] = 0;  // keep the active filter visible
-  const chip = (key, label) => el("button", { type: "button", class: "chip", "aria-pressed": String(state.topic === key),
-                                              text: label, onclick: () => { state.topic = key; apply(); } });
-  $("topics").replaceChildren(chip("", "All topics"),
-    ...Object.keys(counts).sort((a, b) => counts[b] - counts[a]).map((t) => chip(t, D.topics[t] + " " + counts[t])));
-
-  const total = D.items.length, finished = D.items.filter((it) => done.has(it.id)).length;
-  $("progress").textContent = finished + " of " + total + " done";
-  const open = shown.filter((it) => !done.has(it.id)).length;
-  $("mark-shown").textContent = "Mark " + open + " shown as done";
-  $("mark-shown").disabled = open === 0;
-}
-
-function setTab(key) {
-  state.tab = key;
-  state.topic = "";
-  history.replaceState(null, "", key === "all" ? location.pathname : "#" + key);
-  apply();
-  window.scrollTo(0, 0);
-}
-
-function order() {
-  const items = state.oldest ? [...D.items].reverse() : D.items;
-  $("grid").replaceChildren(...items.map((it) => cards.get(it.id)));
-}
-
-let searchTimer;
-$("q").addEventListener("input", (e) => {
-  clearTimeout(searchTimer);
-  searchTimer = setTimeout(() => { state.q = e.target.value.trim().toLowerCase(); apply(); }, 120);
-});
-document.addEventListener("keydown", (e) => {
-  if (e.key === "/" && !["INPUT", "SELECT", "TEXTAREA"].includes(document.activeElement.tagName)) {
-    e.preventDefault();
-    $("q").focus();
-  }
-});
-$("also").addEventListener("change", (e) => { state.also = e.target.checked; apply(); });
-$("hide-done").checked = state.hideDone;
-$("hide-done").addEventListener("change", (e) => {
-  state.hideDone = e.target.checked;
-  localStorage.setItem(HIDE_KEY, state.hideDone ? "1" : "0");
-  apply();
-});
-$("sort").addEventListener("change", (e) => { state.oldest = e.target.value === "old"; order(); });
-$("mark-shown").addEventListener("click", () => {
-  const ids = shown.filter((it) => !done.has(it.id)).map((it) => it.id);
-  if (!ids.length || !confirm("Mark " + ids.length + " bookmarks as done?")) return;
-  setDone(ids, true);
-  toast("Marked " + ids.length + " done", () => setDone(ids, false));
-});
-
-$("generated").textContent = "generated " + D.generated;
-const tabFromHash = () => (location.hash.slice(1) in D.intents ? location.hash.slice(1) : "all");
-window.addEventListener("hashchange", () => { if (tabFromHash() !== state.tab) setTab(tabFromHash()); });
-state.tab = tabFromHash();
-D.items.forEach((it) => paintDone(it.id));
-order();
-apply();
-</script>
-</html>
-`;
 
 process.on("SIGINT", () => {
   log("interrupted; everything finished so far is saved");

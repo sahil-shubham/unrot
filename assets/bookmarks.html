@@ -1,0 +1,279 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>X bookmarks</title>
+<style>
+  :root { --bg: #fafaf9; --fg: #1c1917; --muted: #78716c; --line: #e7e5e4; --card: #fff; --soft: #f5f5f4;
+          --accent: #2563eb; --ok: #15803d; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #0c0a09; --fg: #e7e5e4; --muted: #a8a29e; --line: #292524; --card: #1c1917; --soft: #292524;
+            --accent: #60a5fa; --ok: #4ade80; }
+  }
+  * { box-sizing: border-box; }
+  [hidden] { display: none !important; }
+  body { margin: 0; background: var(--bg); color: var(--fg);
+         font: 14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  button { font: inherit; color: inherit; cursor: pointer; }
+  header { position: sticky; top: 0; z-index: 2; background: var(--bg); border-bottom: 1px solid var(--line);
+           padding: 12px 20px 10px; }
+  .top { display: flex; align-items: baseline; gap: 14px; flex-wrap: wrap; }
+  h1 { font-size: 18px; margin: 0; }
+  .muted { color: var(--muted); }
+  .tabs, .controls, .topics { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; margin-top: 10px; }
+  .tab { border: 1px solid var(--line); background: var(--card); border-radius: 8px; padding: 5px 11px; }
+  .tab .n { color: var(--muted); margin-left: 4px; }
+  .tab[aria-pressed="true"] { background: var(--fg); border-color: var(--fg); color: var(--bg); }
+  .tab[aria-pressed="true"] .n { color: inherit; opacity: .7; }
+  .controls { gap: 14px; }
+  input[type="search"] { flex: 1 1 260px; max-width: 420px; padding: 6px 10px; border: 1px solid var(--line);
+                         border-radius: 8px; background: var(--card); color: var(--fg); font: inherit; }
+  label { display: flex; gap: 5px; align-items: center; color: var(--muted); cursor: pointer; }
+  select, .plain { border: 1px solid var(--line); background: var(--card); color: var(--fg); font: inherit;
+                   border-radius: 8px; padding: 4px 9px; }
+  .chip { border: 1px solid var(--line); background: var(--soft); border-radius: 999px; padding: 2px 10px; font-size: 12px; }
+  .chip[aria-pressed="true"] { background: var(--accent); border-color: var(--accent); color: #fff; }
+  main { padding: 16px 20px 80px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 14px; align-items: start; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; overflow: hidden;
+          display: flex; flex-direction: column; }
+  .card.is-done { opacity: .5; }
+  .media { position: relative; display: block; aspect-ratio: 16 / 10; overflow: hidden; background: var(--soft); }
+  .media img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; }
+  .badge { position: absolute; right: 8px; bottom: 8px; background: rgba(0, 0, 0, .65); color: #fff;
+           border-radius: 6px; padding: 1px 7px; font-size: 12px; }
+  .body { padding: 12px 14px; display: flex; flex-direction: column; gap: 7px; }
+  h3 { margin: 0; font-size: 15px; line-height: 1.3; overflow-wrap: anywhere; }
+  .note { margin: 0; overflow-wrap: anywhere; }
+  .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; font-size: 12px; color: var(--muted); }
+  .tag { font-size: 11px; padding: 1px 7px; border-radius: 999px; background: var(--soft); }
+  .tag.main { color: var(--fg); }
+  details { font-size: 13px; }
+  summary { cursor: pointer; color: var(--muted); font-size: 12px; }
+  .text, blockquote { white-space: pre-wrap; overflow-wrap: anywhere; margin: 6px 0 0; }
+  blockquote { padding-left: 10px; border-left: 3px solid var(--line); color: var(--muted); }
+  .actions { display: flex; justify-content: flex-end; }
+  .done { border: 1px solid var(--line); background: none; border-radius: 8px; padding: 3px 10px; font-size: 12px; }
+  .card.is-done .done { color: var(--ok); border-color: var(--ok); }
+  .empty { color: var(--muted); text-align: center; padding: 60px 0; }
+  .toast { position: fixed; left: 50%; bottom: 20px; transform: translateX(-50%); z-index: 3; display: flex; gap: 14px;
+           background: var(--fg); color: var(--bg); padding: 8px 14px; border-radius: 8px; }
+  .toast button { background: none; border: 0; text-decoration: underline; padding: 0; }
+</style>
+
+<header>
+  <div class="top">
+    <h1>X bookmarks</h1>
+    <span class="muted" id="progress"></span>
+    <span class="muted" id="generated"></span>
+  </div>
+  <nav class="tabs" id="tabs"></nav>
+  <div class="controls">
+    <input type="search" id="q" placeholder="Search titles, notes, post text, @authors   ( / )" autocomplete="off">
+    <label><input type="checkbox" id="also" checked> Include secondary reasons</label>
+    <label><input type="checkbox" id="hide-done"> Hide done</label>
+    <select id="sort" aria-label="Order">
+      <option value="new">Newest bookmark first</option>
+      <option value="old">Oldest bookmark first</option>
+    </select>
+    <button type="button" class="plain" id="mark-shown"></button>
+  </div>
+  <div class="topics" id="topics"></div>
+</header>
+<main>
+  <div class="grid" id="grid"></div>
+  <p class="empty" id="empty" hidden>Nothing matches.</p>
+</main>
+<div class="toast" id="toast" hidden></div>
+
+<script id="data" type="application/json">__BOOKMARKS_DATA__</script>
+<script>
+"use strict";
+const D = JSON.parse(document.getElementById("data").textContent);
+const DONE_KEY = "xbm:done", HIDE_KEY = "xbm:hide-done";
+const done = new Set(JSON.parse(localStorage.getItem(DONE_KEY) || "[]"));
+const state = { tab: "all", topic: "", q: "", also: true, hideDone: localStorage.getItem(HIDE_KEY) === "1", oldest: false };
+const $ = (id) => document.getElementById(id);
+const safeUrl = (u) => (/^https?:\/\//i.test(u || "") ? u : null);
+
+// Builds elements with textContent only: post text never becomes markup.
+function el(tag, props, ...kids) {
+  const e = document.createElement(tag);
+  for (const [k, v] of Object.entries(props || {})) {
+    if (v == null || v === false) continue;
+    if (k === "text") e.textContent = v;
+    else if (k === "class") e.className = v;
+    else if (k.startsWith("on")) e.addEventListener(k.slice(2), v);
+    else e.setAttribute(k, v === true ? "" : v);
+  }
+  for (const kid of kids) if (kid) e.append(kid);
+  return e;
+}
+const extLink = (url, text) => {
+  const href = safeUrl(url);
+  return href ? el("a", { href, target: "_blank", rel: "noopener noreferrer", text }) : el("span", { text });
+};
+
+function buildCard(it) {
+  const card = el("article", { class: "card" });
+  const cover = it.media[0];
+  if (cover && safeUrl(cover.thumb)) {
+    const media = el("a", { class: "media", href: safeUrl(cover.full) || safeUrl(it.url), target: "_blank",
+                            rel: "noopener noreferrer" });
+    media.append(el("img", { src: cover.thumb, loading: "lazy", alt: "", onerror: () => media.remove() }));
+    const badge = [cover.video ? "▶ video" : "", it.media.length > 1 ? "+" + (it.media.length - 1) : ""]
+      .filter(Boolean).join("  ");
+    if (badge) media.append(el("span", { class: "badge", text: badge }));
+    card.append(media);
+  }
+  const body = el("div", { class: "body" }, el("h3", { text: it.title }),
+                  it.note ? el("p", { class: "note", text: it.note }) : null);
+  const links = el("div", { class: "row" });
+  if (it.link) links.append(extLink(it.link, it.linkHost + " ↗"));
+  links.append(extLink(it.url, "@" + it.user + " · " + it.date));
+  body.append(links, el("div", { class: "row" },
+    el("span", { class: "tag main", text: D.intents[it.intent] }),
+    ...it.also.map((a) => el("span", { class: "tag", text: "also " + D.intents[a] })),
+    el("span", { class: "tag", text: D.topics[it.topic] })));
+  if (it.text || it.quoted) {
+    const details = el("details", {}, el("summary", { text: "Post text" }));
+    if (it.text) details.append(el("p", { class: "text", text: it.text }));
+    if (it.quoted) details.append(el("blockquote", { text: "@" + it.quoted.user + ": " + it.quoted.text }));
+    body.append(details);
+  }
+  const button = el("button", { type: "button", class: "done", onclick: () => toggleDone(it.id) });
+  body.append(el("div", { class: "actions" }, button));
+  card.append(body);
+  card.doneButton = button;
+  return card;
+}
+
+const cards = new Map();
+for (const it of D.items) {
+  it.hay = [it.title, it.note, it.text, it.user, it.name, it.link, it.quoted && it.quoted.user,
+            it.quoted && it.quoted.text].filter(Boolean).join("\n").toLowerCase();
+  cards.set(it.id, buildCard(it));
+}
+
+function paintDone(id) {
+  const card = cards.get(id), isDone = done.has(id);
+  card.classList.toggle("is-done", isDone);
+  card.doneButton.textContent = isDone ? "✓ Done" : "Mark done";
+}
+
+function setDone(ids, value) {
+  for (const id of ids) value ? done.add(id) : done.delete(id);
+  localStorage.setItem(DONE_KEY, JSON.stringify([...done]));
+  ids.forEach(paintDone);
+  apply();
+}
+
+function toggleDone(id) {
+  const value = !done.has(id);
+  setDone([id], value);
+  if (value) toast("Marked done", () => setDone([id], false));
+}
+
+let toastTimer;
+function toast(message, undo) {
+  const t = $("toast");
+  t.replaceChildren(el("span", { text: message }),
+                    el("button", { type: "button", text: "Undo", onclick: () => { undo(); t.hidden = true; } }));
+  t.hidden = false;
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => { t.hidden = true; }, 6000);
+}
+
+function shows(it, tab, ignoreTopic) {
+  if (tab !== "all" && it.intent !== tab && !(state.also && it.also.includes(tab))) return false;
+  if (state.hideDone && done.has(it.id)) return false;
+  if (!ignoreTopic && state.topic && it.topic !== state.topic) return false;
+  return !state.q || it.hay.includes(state.q);
+}
+
+const tabs = ["all", ...Object.keys(D.intents)].map((key) => {
+  const button = el("button", { type: "button", class: "tab", onclick: () => setTab(key) },
+                    key === "all" ? "All" : D.intents[key], el("span", { class: "n" }));
+  button.dataset.tab = key;
+  $("tabs").append(button);
+  return button;
+});
+
+let shown = [];
+function apply() {
+  shown = D.items.filter((it) => shows(it, state.tab, false));
+  const visible = new Set(shown.map((it) => it.id));
+  for (const [id, card] of cards) card.hidden = !visible.has(id);
+  $("empty").hidden = shown.length > 0;
+
+  for (const button of tabs) {
+    const key = button.dataset.tab;
+    button.setAttribute("aria-pressed", String(key === state.tab));
+    button.querySelector(".n").textContent = D.items.filter((it) => shows(it, key, true)).length;
+  }
+
+  const counts = {};
+  for (const it of D.items) if (shows(it, state.tab, true)) counts[it.topic] = (counts[it.topic] || 0) + 1;
+  if (state.topic && !(state.topic in counts)) counts[state.topic] = 0;  // keep the active filter visible
+  const chip = (key, label) => el("button", { type: "button", class: "chip", "aria-pressed": String(state.topic === key),
+                                              text: label, onclick: () => { state.topic = key; apply(); } });
+  $("topics").replaceChildren(chip("", "All topics"),
+    ...Object.keys(counts).sort((a, b) => counts[b] - counts[a]).map((t) => chip(t, D.topics[t] + " " + counts[t])));
+
+  const total = D.items.length, finished = D.items.filter((it) => done.has(it.id)).length;
+  $("progress").textContent = finished + " of " + total + " done";
+  const open = shown.filter((it) => !done.has(it.id)).length;
+  $("mark-shown").textContent = "Mark " + open + " shown as done";
+  $("mark-shown").disabled = open === 0;
+}
+
+function setTab(key) {
+  state.tab = key;
+  state.topic = "";
+  history.replaceState(null, "", key === "all" ? location.pathname : "#" + key);
+  apply();
+  window.scrollTo(0, 0);
+}
+
+function order() {
+  const items = state.oldest ? [...D.items].reverse() : D.items;
+  $("grid").replaceChildren(...items.map((it) => cards.get(it.id)));
+}
+
+let searchTimer;
+$("q").addEventListener("input", (e) => {
+  clearTimeout(searchTimer);
+  searchTimer = setTimeout(() => { state.q = e.target.value.trim().toLowerCase(); apply(); }, 120);
+});
+document.addEventListener("keydown", (e) => {
+  if (e.key === "/" && !["INPUT", "SELECT", "TEXTAREA"].includes(document.activeElement.tagName)) {
+    e.preventDefault();
+    $("q").focus();
+  }
+});
+$("also").addEventListener("change", (e) => { state.also = e.target.checked; apply(); });
+$("hide-done").checked = state.hideDone;
+$("hide-done").addEventListener("change", (e) => {
+  state.hideDone = e.target.checked;
+  localStorage.setItem(HIDE_KEY, state.hideDone ? "1" : "0");
+  apply();
+});
+$("sort").addEventListener("change", (e) => { state.oldest = e.target.value === "old"; order(); });
+$("mark-shown").addEventListener("click", () => {
+  const ids = shown.filter((it) => !done.has(it.id)).map((it) => it.id);
+  if (!ids.length || !confirm("Mark " + ids.length + " bookmarks as done?")) return;
+  setDone(ids, true);
+  toast("Marked " + ids.length + " done", () => setDone(ids, false));
+});
+
+$("generated").textContent = "generated " + D.generated;
+const tabFromHash = () => (location.hash.slice(1) in D.intents ? location.hash.slice(1) : "all");
+window.addEventListener("hashchange", () => { if (tabFromHash() !== state.tab) setTab(tabFromHash()); });
+state.tab = tabFromHash();
+D.items.forEach((it) => paintDone(it.id));
+order();
+apply();
+</script>
+</html>
