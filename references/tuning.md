@@ -21,4 +21,4 @@ When neither file exists, set them up with the user:
    - Adjust the files and re-run with `--redo --limit 20` until it looks right.
    - Then process the rest ([syncing.md](syncing.md)).
 
-Changing lists after a full run means running `unrot <ig|x> process --redo` and then `export`. The redo re-sorts everything, so it costs credit or subscription quota. Until then, items filed under lists that no longer exist don't appear in any list.
+Changing lists after a full run means running `unrot <ig|x> process --redo` and then `export`. The redo re-sorts everything, so it costs credit or subscription quota. `export` deletes the files of lists that no longer exist; until the redo, items filed under those lists don't appear in any list.

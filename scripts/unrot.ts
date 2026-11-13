@@ -12,11 +12,11 @@
 import { Database, type SQLQueryBindings } from "bun:sqlite";
 import { createDecipheriv, createHash, pbkdf2Sync, randomBytes } from "node:crypto";
 import {
-  chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync,
+  copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync,
   statSync, writeFileSync,
 } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { basename, dirname, join } from "node:path";
+import { basename, dirname, isAbsolute, join } from "node:path";
 import { parseArgs } from "node:util";
 import { parseHTML } from "linkedom";
 import { ClientTransaction } from "x-client-transaction-id";
@@ -84,8 +84,19 @@ const DEFAULT_X_TOPICS: Record<string, string> = {
 
 // ── Settings ───────────────────────────────────────────────────────────────────────────────────────
 
+/** Every environment variable this script reads. */
+const SETTINGS = ["UNROT_HOME", "UNROT_PROVIDER", "UNROT_MODEL", "UNROT_BROWSER", "OPENROUTER_API_KEY",
+  "CLAUDE_CODE_OAUTH_TOKEN", "CLAUDE_CONFIG_DIR", "CODEX_HOME", "PI_CODING_AGENT_DIR"];
+// Bun loads .env files from the working directory before this file runs, so whatever project the agent is
+// in could set this script's settings and keys. They come only from the shell and the data folder's .env,
+// so values that match the working directory's .env files are dropped.
+for (const name of [".env", ".env.local", ...["development", "production", "test"].flatMap((m) => [`.env.${m}`, `.env.${m}.local`])]) {
+  const values = readDotenv(join(process.cwd(), name));
+  for (const key of SETTINGS) if (values[key] !== undefined && process.env[key] === values[key]) delete process.env[key];
+}
+
 const HOME = process.env.UNROT_HOME || join(homedir(), ".local/share/unrot");
-loadDotenv(join(HOME, ".env"));
+for (const [key, value] of Object.entries(readDotenv(join(HOME, ".env")))) process.env[key] ??= value;
 const AUTH_FILE = join(HOME, "auth.json");
 const IG_DB = join(HOME, "instagram/reels.db");
 const IG_MEDIA = join(HOME, "instagram/media");
@@ -105,14 +116,22 @@ const DEFAULT_MODELS: Record<Provider, string> = {
 const ABOUT = existsSync(join(HOME, "about.md")) ? readFileSync(join(HOME, "about.md"), "utf8").trim() : "";
 const { IG_LISTS, IG_GROUP_BY_LOCATION, X_INTENTS, X_TOPICS } = loadLists(join(HOME, "lists.json"));
 
-function loadDotenv(path: string): void {
-  if (!existsSync(path)) return;
-  for (const raw of readFileSync(path, "utf8").split("\n")) {
-    const line = raw.trim();
-    if (!line || line.startsWith("#") || !line.includes("=")) continue;
-    const at = line.indexOf("=");
-    process.env[line.slice(0, at).trim()] ??= line.slice(at + 1).trim().replace(/^["']+|["']+$/g, "");
+/** KEY=value pairs from a .env file; comments, blank lines and surrounding quotes are dropped. */
+function readDotenv(path: string): Record<string, string> {
+  const values: Record<string, string> = {};
+  let text: string;
+  try {
+    text = readFileSync(path, "utf8");
+  } catch {
+    return values; // no such file
   }
+  for (const raw of text.split(/\r?\n/)) {
+    const line = raw.trim().replace(/^export\s+/, "");
+    const at = line.indexOf("=");
+    if (line.startsWith("#") || at < 1) continue;
+    values[line.slice(0, at).trim()] = line.slice(at + 1).trim().replace(/^["']+|["']+$/g, "");
+  }
+  return values;
 }
 
 /**
@@ -135,7 +154,7 @@ function loadLists(path: string) {
       groupByLocation: z.array(z.string()).optional(),
     }).optional(),
     x: z.object({
-      intents: lists.optional(),
+      intents: lists.refine((r) => !has(r, "all"), '"all" is taken by the viewer\'s All tab').optional(),
       topics: z.record(key, label).refine((r) => Object.keys(r).length > 0, "needs at least one topic").optional(),
     }).optional(),
   });
@@ -225,6 +244,22 @@ function openDb(path: string, schema: string): Database {
   db.run("PRAGMA foreign_keys = ON");
   db.run(schema);
   return db;
+}
+
+const LAST_WALK_SQL = "SELECT value FROM meta WHERE key = 'last_complete_walk'";
+/** Whether a sync has walked the whole saved list; until one has, every sync walks all of it. */
+const walkedAll = (db: Database) => Boolean(db.query<{ value: string }, []>(LAST_WALK_SQL).get());
+function markWalkedAll(db: Database): void {
+  db.run("INSERT INTO meta (key, value) VALUES ('last_complete_walk', ?) ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+    [String(nowSeconds())]);
+}
+
+/** Deletes list files whose list no longer exists; the lists folder is rewritten on every export. */
+function removeOldLists(dir: string, keys: string[]): void {
+  for (const file of readdirSync(dir)) {
+    const key = file.match(/^([a-z][a-z0-9_]*)\.md$/)?.[1];
+    if (key && !keys.includes(key)) rmSync(join(dir, file));
+  }
 }
 
 const SQL_MAX_ROWS = 200;
@@ -341,7 +376,8 @@ function firefoxDefaultProfile(): string {
   }
   // The profile this Firefox install launches, else the one marked default.
   const install = sections.find(([name, s]) => name.startsWith("Install") && s.Default);
-  if (install) return join(root, install[1].Default!);
+  const installed = install?.[1].Default;
+  if (installed) return isAbsolute(installed) ? installed : join(root, installed);
   const marked = sections.find(([, s]) => s.Default === "1" && s.Path);
   if (marked) return (marked[1].IsRelative ?? "1") === "1" ? join(root, marked[1].Path!) : marked[1].Path!;
   throw new Fatal(`no default Firefox profile in ${ini}; pass --profile DIR`);
@@ -380,13 +416,26 @@ function chromiumKey(browser: string, scheme: string): Buffer {
   return key;
 }
 
-function chromiumCookies(browser: string, profile: string | undefined, domain: string): Cookies {
+function chromiumRoot(browser: string): string {
   const spec = CHROMIUM[browser]!;
   const root = process.platform === "darwin" ? join(homedir(), "Library/Application Support", spec.mac)
     : process.platform === "linux" && spec.linux ? join(homedir(), ".config", spec.linux[0])
     : undefined;
   if (!root) throw new Fatal(`can't read ${browser} cookies on ${process.platform}; use --browser firefox or --cookies FILE`);
-  const dir = profile?.includes("/") ? profile : join(root, profile ?? "Default");
+  return root;
+}
+
+/** The profile the browser opened last, from its "Local State" file; else "Default". */
+function chromiumLastProfile(root: string): string {
+  try {
+    const used = fields(fields(JSON.parse(readFileSync(join(root, "Local State"), "utf8"))).profile).last_used;
+    return typeof used === "string" && used ? used : "Default";
+  } catch {
+    return "Default"; // no Local State yet
+  }
+}
+
+function chromiumCookies(browser: string, dir: string, domain: string): Cookies {
   const file = [join(dir, "Network/Cookies"), join(dir, "Cookies")].find((f) => existsSync(f));
   if (!file) throw new Fatal(`no ${browser} cookie database in ${dir}`);
   const hosts = cookieHosts(domain);
@@ -428,8 +477,10 @@ function writeNetscapeCookies(cookies: Cookies, domain: string, path: string): v
   const expiry = nowSeconds() + 365 * 86400;
   const lines = ["# Netscape HTTP Cookie File",
     ...Object.entries(cookies).map(([k, v]) => `.${domain}\tTRUE\t/\tTRUE\t${expiry}\t${k}\t${v}`)];
-  writeFileSync(path, `${lines.join("\n")}\n`, { mode: 0o600 });
-  chmodSync(path, 0o600);
+  // A new private file moved over the destination: an existing file keeps its permissions when written to.
+  const temp = `${path}.${process.pid}.tmp`;
+  writeFileSync(temp, `${lines.join("\n")}\n`, { mode: 0o600 });
+  renameSync(temp, path);
 }
 
 function appMajorVersion(app: string): string | undefined {
@@ -469,11 +520,10 @@ function browserSession(domain: string, opts: SessionOptions): Session {
   if (!has(CHROMIUM, browser)) {
     throw new Fatal(`unknown browser "${browser}": use firefox, ${Object.keys(CHROMIUM).join(", ")}, or --cookies FILE`);
   }
-  return {
-    cookies: chromiumCookies(browser, opts.profile, domain),
-    userAgent: userAgent(browser),
-    source: `${browser} profile ${opts.profile ?? "Default"}`,
-  };
+  const root = chromiumRoot(browser);
+  const profile = opts.profile ?? chromiumLastProfile(root);
+  const dir = isAbsolute(profile) ? profile : join(root, profile);
+  return { cookies: chromiumCookies(browser, dir, domain), userAgent: userAgent(browser), source: `${browser} profile ${basename(dir)}` };
 }
 
 // ── Model providers ────────────────────────────────────────────────────────────────────────────────
@@ -532,8 +582,9 @@ function readAuth(): AuthFile {
 }
 function writeAuth(auth: AuthFile): void {
   mkdirSync(HOME, { recursive: true });
-  writeFileSync(`${AUTH_FILE}.tmp`, `${JSON.stringify(auth, null, 2)}\n`, { mode: 0o600 });
-  renameSync(`${AUTH_FILE}.tmp`, AUTH_FILE);
+  const temp = `${AUTH_FILE}.${process.pid}.tmp`; // an Instagram and an X run may write at the same time
+  writeFileSync(temp, `${JSON.stringify(auth, null, 2)}\n`, { mode: 0o600 });
+  renameSync(temp, AUTH_FILE);
 }
 
 /** The claims of an OpenAI access token (a JWT: decoded, not verified). */
@@ -574,7 +625,13 @@ function parseJson(text: string | undefined): unknown {
     return undefined;
   }
 }
-const readText = (path: string) => (existsSync(path) ? readFileSync(path, "utf8") : undefined);
+const readText = (path: string) => {
+  try {
+    return readFileSync(path, "utf8");
+  } catch {
+    return undefined; // missing or unreadable: not a store this script can use
+  }
+};
 
 /**
  * Subscription logins already on this machine, preferred first: an explicit token, this tool's own login,
@@ -646,10 +703,20 @@ async function subscriptionLogin(provider: "claude" | "codex", rejected?: string
     let pending = refreshing.get(provider);
     if (!pending) {
       pending = (async () => {
-        const next = await tokenRequest(provider, provider === "claude"
-          ? { grant_type: "refresh_token", client_id: CLAUDE_CLIENT_ID, refresh_token: own.refresh }
-          : { grant_type: "refresh_token", refresh_token: own.refresh, client_id: CODEX_CLIENT_ID });
-        const token: Token = { ...next, email: next.email ?? own.email };
+        let token: Token;
+        try {
+          const next = await tokenRequest(provider, provider === "claude"
+            ? { grant_type: "refresh_token", client_id: CLAUDE_CLIENT_ID, refresh_token: own.refresh }
+            : { grant_type: "refresh_token", refresh_token: own.refresh, client_id: CODEX_CLIENT_ID });
+          token = { ...next, email: next.email ?? own.email };
+        } catch (err) {
+          // Another unrot process may have refreshed first, which rotates the refresh token sent here: use its login.
+          const saved = readAuth()[provider];
+          if (saved && saved.refresh !== own.refresh && saved.expires > Date.now() + 60_000) {
+            return { access: saved.access, expires: saved.expires, source: "unrot", own: saved };
+          }
+          throw err;
+        }
         const auth = readAuth();
         auth[provider] = token;
         writeAuth(auth);
@@ -670,11 +737,11 @@ async function subscriptionLogin(provider: "claude" | "codex", rejected?: string
   return chosen;
 }
 
-/** POSTs with a subscription login, looking for a fresh one once if the API rejects it. */
-async function subscriptionPost(provider: "claude" | "codex", url: string, headers: (access: string) => Record<string, string>, body: string, timeoutMs: number): Promise<Response> {
+/** Fetches with a subscription login, looking for a fresh one once if the API rejects it. */
+async function subscriptionFetch(provider: "claude" | "codex", url: string, init: (access: string) => RequestInit): Promise<Response> {
   let login = await subscriptionLogin(provider);
   for (let attempt = 0; ; attempt++) {
-    const res = await fetch(url, { method: "POST", headers: headers(login.access), body, signal: AbortSignal.timeout(timeoutMs) });
+    const res = await fetch(url, init(login.access));
     if (res.status !== 401) return res;
     if (attempt) throw new Fatal(`${provider} rejected the ${login.source} login (HTTP 401); log in again there or run \`unrot login ${provider}\``);
     login = await subscriptionLogin(provider, login.access);
@@ -729,6 +796,11 @@ function openRouterModel(model: string): Model {
         }),
         signal: AbortSignal.timeout(req.timeoutMs),
       });
+      if (res.status === 401 || res.status === 402) {
+        // The key or the account, not this item: stop the batch and leave the rest pending.
+        const why = res.status === 401 ? "the API key was rejected" : "the account is out of credit";
+        throw new Fatal(`OpenRouter HTTP ${res.status}: ${why}; fix OPENROUTER_API_KEY in ${join(HOME, ".env")} or add credit, then run process again`);
+      }
       if (!res.ok) throw new HttpError(res.status, await res.text(), res.headers, "OpenRouter");
       const data = await readJson<OpenRouterReply>(res);
       if (data.error) throw new Error(`OpenRouter: ${JSON.stringify(data.error)}`);
@@ -756,7 +828,8 @@ function claudeModel(model: string): Model {
         tools: [{ name: req.name, description: "Record the result.", input_schema: req.schema }],
         tool_choice: { type: "tool", name: req.name },
       });
-      const res = await subscriptionPost("claude", "https://api.anthropic.com/v1/messages", claudeHeaders, body, req.timeoutMs);
+      const res = await subscriptionFetch("claude", "https://api.anthropic.com/v1/messages",
+        (access) => ({ method: "POST", headers: claudeHeaders(access), body, signal: AbortSignal.timeout(req.timeoutMs) }));
       if (!res.ok) {
         const text = await res.text();
         if (res.status === 404 && text.includes("model")) {
@@ -793,7 +866,9 @@ function codexModel(model: string): Model {
         stream: true, // the ChatGPT backend only streams
         store: false,
       });
-      const res = await subscriptionPost("codex", `${CODEX_API}/responses`, (t) => ({ ...codexHeaders(t), Accept: "text/event-stream" }), body, req.timeoutMs);
+      const res = await subscriptionFetch("codex", `${CODEX_API}/responses`, (access) => ({
+        method: "POST", headers: { ...codexHeaders(access), Accept: "text/event-stream" }, body, signal: AbortSignal.timeout(req.timeoutMs),
+      }));
       if (!res.ok) {
         const text = await res.text();
         if (text.includes("model_not_found")) {
@@ -928,13 +1003,15 @@ function callbackServer(port: number, path: string, state: string): CallbackServ
     fetch(req) {
       const url = new URL(req.url);
       if (url.pathname !== path) return new Response("not found", { status: 404 });
+      // Only a redirect carrying this attempt's state counts, so no other page can end the login.
+      if (url.searchParams.get("state") !== state) return page("Unexpected login response.", 400);
       const error = url.searchParams.get("error");
       if (error) {
         reject(new Fatal(`login failed: ${error} ${url.searchParams.get("error_description") ?? ""}`.trim()));
         return page("Login failed. Check the terminal.", 400);
       }
       const code = url.searchParams.get("code");
-      if (url.searchParams.get("state") !== state || !code) return page("Unexpected login response.", 400);
+      if (!code) return page("Unexpected login response.", 400);
       resolve(code);
       return page("Logged in. You can close this tab and go back to the terminal.");
     },
@@ -955,9 +1032,8 @@ async function login(provider: string | undefined): Promise<void> {
   let server: CallbackServer | undefined;
   let url: URL;
   let redirectUri: string;
-  let state: string;
+  const state = randomBytes(32).toString("base64url"); // separate from the verifier: the state travels in URLs
   if (provider === "claude") {
-    state = verifier;
     for (const port of [53692, 0]) { // Anthropic accepts any loopback port
       try {
         server = callbackServer(port, "/callback", state);
@@ -973,7 +1049,6 @@ async function login(provider: string | undefined): Promise<void> {
       code_challenge: challenge, code_challenge_method: "S256", state,
     }).toString();
   } else {
-    state = randomBytes(16).toString("hex");
     redirectUri = "http://localhost:1455/auth/callback"; // the only redirect OpenAI accepts for this client
     try {
       server = callbackServer(1455, "/auth/callback", state);
@@ -1017,12 +1092,14 @@ async function login(provider: string | undefined): Promise<void> {
 
 async function listModels(provider: string | undefined): Promise<void> {
   if (provider === "claude") {
-    const res = await fetch("https://api.anthropic.com/v1/models?limit=100", { headers: claudeHeaders((await subscriptionLogin("claude")).access) });
+    const res = await subscriptionFetch("claude", "https://api.anthropic.com/v1/models?limit=100",
+      (access) => ({ headers: claudeHeaders(access), signal: AbortSignal.timeout(30_000) }));
     if (!res.ok) throw new HttpError(res.status, await res.text(), res.headers, "Claude");
     const reply = await readJson<{ data: { id: string; display_name?: string }[] }>(res);
     for (const m of reply.data) console.log(`${m.id}\t${m.display_name ?? ""}`);
   } else if (provider === "codex") {
-    const res = await fetch(`${CODEX_API}/models?client_version=${CODEX_VERSION}`, { headers: codexHeaders((await subscriptionLogin("codex")).access) });
+    const res = await subscriptionFetch("codex", `${CODEX_API}/models?client_version=${CODEX_VERSION}`,
+      (access) => ({ headers: codexHeaders(access), signal: AbortSignal.timeout(30_000) }));
     if (!res.ok) throw new HttpError(res.status, await res.text(), res.headers, "Codex");
     const reply = await readJson<{ models: { slug: string; description?: string; visibility?: string; input_modalities?: string[] }[] }>(res);
     for (const m of reply.models) {
@@ -1115,15 +1192,21 @@ class Instagram {
     return data;
   }
 
-  /** Saved items newest-first, one array per page, `delay` seconds apart. */
-  async *savedPages(delay: [min: number, max: number]): AsyncGenerator<IgMedia[]> {
+  /** Set once a walk reaches the end of the saved feed. */
+  reachedEnd = false;
+
+  /** Saved items newest-first, one array per page, 15 to 30 s apart. */
+  async *savedPages(): AsyncGenerator<IgMedia[]> {
     const params: Record<string, string> = { count: "50" };
     for (;;) {
       const data = await this.get("/feed/saved/posts/", params);
       yield (data.items ?? []).map((item) => item.media);
-      if (!data.more_available || !data.next_max_id) return;
+      if (!data.more_available || !data.next_max_id) {
+        this.reachedEnd = true;
+        return;
+      }
       params.max_id = data.next_max_id;
-      await sleep(delay[0] + Math.random() * (delay[1] - delay[0]));
+      await sleep(15 + Math.random() * 15);
     }
   }
 }
@@ -1161,6 +1244,7 @@ function igAssets(m: IgMedia): IgAsset[] {
 async function igDownload(url: string, dest: string, agent: string): Promise<void> {
   if (existsSync(dest)) return;
   const res = await fetch(url, { headers: { "User-Agent": agent, Referer: "https://www.instagram.com/" }, signal: AbortSignal.timeout(120_000) });
+  if (res.status === 429) throw new Fatal("instagram's media server: HTTP 429 (rate limited); stop and retry in a few hours");
   if ([403, 404, 410].includes(res.status)) {
     throw new Error("media URL expired: run `ig sync --full`, then `ig process --retry-errors`");
   }
@@ -1301,6 +1385,7 @@ function igResult(json: unknown, m: IgMedia): IgResult {
   if (track && !entries.every((e) => e.category === "music")) {
     entries = entries.filter((e) => !(e.category === "music" && fold(e.title).includes(track)));
   }
+  if (!entries.length) throw new Error("the answer has no entries"); // every post gets at least one; asking again fixes it
   return { ...answer, entries };
 }
 
@@ -1374,6 +1459,11 @@ CREATE TABLE IF NOT EXISTS entries (
 );
 CREATE INDEX IF NOT EXISTS entries_category ON entries(category);
 
+CREATE TABLE IF NOT EXISTS meta (
+    key    TEXT PRIMARY KEY,
+    value  TEXT NOT NULL
+);
+
 CREATE VIEW IF NOT EXISTS entries_v AS
     SELECT e.category, e.title, e.kind, e.creator, e.location, e.details, e.confidence,
            m.url, m.username, m.saved_order, a.summary, e.code
@@ -1381,14 +1471,14 @@ CREATE VIEW IF NOT EXISTS entries_v AS
 `;
 
 /**
- * Inserts a saved item or refreshes its raw JSON (CDN URLs expire); true if it was already known.
- * The feed has no saved-at time, so `savedOrder` is `sync start ms - feed position`: newest first within
- * a sync, and every later sync starts higher.
+ * Inserts a saved item, or refreshes its raw JSON (CDN URLs expire) and position; true if it was already
+ * known. The feed has no saved-at time, so `savedOrder` is `sync start ms - feed position`: newest first
+ * within a sync, every later sync starts higher, and a post saved again moves up.
  */
 function igUpsert(db: Database, m: IgMedia, savedOrder: number): boolean {
   const raw = JSON.stringify(m);
   if (db.query<{ found: number }, [string]>("SELECT 1 AS found FROM media WHERE code = ?").get(m.code)) {
-    db.run("UPDATE media SET raw_json = ? WHERE code = ?", [raw, m.code]);
+    db.run("UPDATE media SET raw_json = ?, saved_order = ? WHERE code = ?", [raw, savedOrder, m.code]);
     return true;
   }
   const url = `https://www.instagram.com/${m.product_type === "clips" ? "reel" : "p"}/${m.code}/`;
@@ -1418,26 +1508,31 @@ function igSaveAnalysis(db: Database, code: string, model: string, r: IgResult, 
 }
 
 interface CommonOptions extends SessionOptions {
-  full?: boolean; maxPages?: number; minDelay?: number; maxDelay?: number;
+  full?: boolean; maxPages?: number;
   limit?: number; workers?: number; retryErrors?: boolean; redo?: boolean; keepMedia?: boolean;
   provider?: string; model?: string;
 }
 
 async function igSync(o: CommonOptions): Promise<void> {
   const db = openDb(IG_DB, IG_SCHEMA_SQL);
-  const ig = new Instagram(browserSession("instagram.com", o));
-  log(`syncing saved posts for Instagram user id ${ig.userId}`);
+  const session = browserSession("instagram.com", o);
+  const ig = new Instagram(session);
+  // Until one walk has reached the end, every sync walks everything: an interrupted first sync would
+  // otherwise stop at the posts it already has and never reach the older ones.
+  const full = o.full || !walkedAll(db);
+  log(`syncing saved posts for Instagram user id ${ig.userId} from ${session.source} (${full ? "full walk" : "new only"})`);
   const start = Date.now();
   let seen = 0, fresh = 0, page = 0;
-  for await (const items of ig.savedPages([o.minDelay ?? 15, o.maxDelay ?? 30])) {
+  for await (const items of ig.savedPages()) {
     page++;
     const known = db.transaction(() => items.filter((m, i) => igUpsert(db, m, start - seen - i)).length)();
     seen += items.length;
     fresh += items.length - known;
     log(`  page ${page}: ${items.length} items, ${items.length - known} new`);
-    if (!o.full && known === items.length) break; // caught up with what's stored
+    if (!full && known === items.length) break; // caught up with what's stored
     if (o.maxPages && page >= o.maxPages) break;
   }
+  if (ig.reachedEnd) markWalkedAll(db);
   log(`sync done: ${fresh} new of ${seen} seen`);
 }
 
@@ -1453,7 +1548,7 @@ async function igProcess(o: CommonOptions): Promise<void> {
   const statuses = ["new", ...(o.retryErrors ? ["error"] : []), ...(o.redo ? ["analyzed"] : [])];
   const rows = db.query<{ code: string; raw_json: string }, SQLQueryBindings[]>(
     `SELECT code, raw_json FROM media WHERE status IN (${placeholders(statuses.length)}) ORDER BY saved_order DESC LIMIT ?`,
-  ).all(...statuses, o.limit || -1);
+  ).all(...statuses, o.limit ?? -1);
   if (!rows.length) return log("nothing to process");
   const model = chooseModel(o);
   const workers = o.workers ?? (model.provider === "openrouter" ? 16 : 4);
@@ -1539,6 +1634,7 @@ function igExport(): string[] {
     written.push(path);
     index.push(`| [${title}](${key}.md) | ${merge(rows).length} |`);
   }
+  removeOldLists(IG_OUT, Object.keys(IG_LISTS));
   const pending = db.query<{ n: number }, []>("SELECT COUNT(*) AS n FROM media WHERE status != 'analyzed'").get()!.n;
   const readme = join(IG_OUT, "README.md");
   writeFileSync(readme, ["# Saved reels", "", `_Generated ${clock()} · ${pending} saved posts not analysed yet_`, "",
@@ -1550,6 +1646,8 @@ function igStatus(): void {
   const db = openDb(IG_DB, IG_SCHEMA_SQL);
   const counts = (sql: string) => db.query<{ k: string; n: number }, []>(sql).all().map((r) => `${r.k} ${r.n}`).join(", ") || "none";
   console.log(`saved posts     ${counts("SELECT status AS k, COUNT(*) AS n FROM media GROUP BY status")}`);
+  const walk = db.query<{ value: string }, []>(LAST_WALK_SQL).get();
+  console.log(`last full walk  ${walk ? localDay(Number(walk.value)) : "never (the next sync walks all saves)"}`);
   console.log(`entries         ${counts("SELECT category AS k, COUNT(*) AS n FROM entries GROUP BY category ORDER BY 2 DESC")}`);
   console.log(`models          ${counts("SELECT model AS k, COUNT(*) AS n FROM analysis GROUP BY model ORDER BY 2 DESC")}`);
   const spend = db.query<{ s: number }, []>("SELECT COALESCE(SUM(cost_usd), 0) AS s FROM analysis").get()!.s;
@@ -1715,11 +1813,14 @@ class XClient {
     }
   }
 
+  /** Set once a walk reaches the end of the bookmarks, not just a run of empty pages. */
+  reachedEnd = false;
+
   /** Bookmarked posts as raw GraphQL tweet objects (with `sortIndex`), most recently bookmarked first. */
   async *bookmarks(): AsyncGenerator<Tweet> {
     let cursor: string | undefined;
     let emptyPages = 0;
-    for (let degraded = 0; ;) {
+    for (let retries = 0; ;) {
       const instructions = (await this.page(cursor)).data?.bookmark_timeline_v2?.timeline?.instructions;
       if (!instructions) throw new Error("X Bookmarks returned no timeline");
       const entries = instructions.flatMap((i) => i.type === "TimelineAddEntries" ? i.entries ?? []
@@ -1734,12 +1835,18 @@ class XClient {
         tweet.sortIndex = entry.sortIndex ?? "0";
         tweets.push(tweet);
       }
-      // X sometimes sends posts without their author; asking again fixes it.
-      if (tweets.some((t) => !t.core?.user_results?.result) && degraded++ < 3) continue;
-      degraded = 0;
-      yield* tweets.filter((t) => t.core?.user_results?.result);
+      // X sometimes sends posts without their author; asking again usually fixes it.
+      const authorless = tweets.filter((t) => !t.core?.user_results?.result).length;
+      if (authorless && retries++ < 3) continue;
+      if (authorless) log(`  X sent ${authorless} post${authorless === 1 ? "" : "s"} without the author; stored without it`);
+      retries = 0;
+      yield* tweets;
+      if (!next || next === cursor) {
+        this.reachedEnd = true;
+        return;
+      }
       emptyPages = tweets.length ? 0 : emptyPages + 1;
-      if (!next || next === cursor || emptyPages >= 3) return;
+      if (emptyPages >= 3) return; // cursors but no posts: stop without calling it the end
       cursor = next;
       await sleep(1.5 + Math.random() * 1.5);
     }
@@ -1866,19 +1973,17 @@ function xUpsert(db: Database, t: Tweet, now: number): boolean {
   return false;
 }
 
-const LAST_WALK_SQL = "SELECT value FROM meta WHERE key = 'last_complete_walk'";
-
 async function xSync(o: CommonOptions): Promise<void> {
   const db = openDb(X_DB, X_SCHEMA_SQL);
   const session = browserSession("x.com", o);
   const client = new XClient(session);
-  await client.init();
   // Until one walk has reached the end, every sync walks everything: an interrupted first sync would
   // otherwise stop at the bookmarks it already has and never reach the older ones.
-  const full = o.full || !db.query<{ value: string }, []>(LAST_WALK_SQL).get();
+  const full = o.full || !walkedAll(db);
   log(`syncing X bookmarks from ${session.source} (${full ? "full walk" : "new only"})`);
+  await client.init();
   const now = nowSeconds();
-  let seen = 0, fresh = 0, knownStreak = 0, reachedEnd = true;
+  let seen = 0, fresh = 0, knownStreak = 0, caughtUp = false;
   for await (const tweet of client.bookmarks()) {
     const known = xUpsert(db, tweet, now);
     seen++;
@@ -1886,13 +1991,12 @@ async function xSync(o: CommonOptions): Promise<void> {
     knownStreak = known ? knownStreak + 1 : 0;
     if (seen % 100 === 0) log(`  ${seen} seen, ${fresh} new`);
     if (!full && knownStreak >= CAUGHT_UP_AFTER) {
-      reachedEnd = false;
+      caughtUp = true;
       break;
     }
   }
-  if (reachedEnd) {
-    db.run("INSERT INTO meta (key, value) VALUES ('last_complete_walk', ?) ON CONFLICT (key) DO UPDATE SET value = excluded.value", [String(now)]);
-  }
+  if (client.reachedEnd) markWalkedAll(db);
+  else if (!caughtUp) log("X stopped sending bookmarks before the end of the list; run sync again later for the rest");
   const total = db.query<{ n: number }, []>("SELECT COUNT(*) AS n FROM bookmarks").get()!.n;
   log(`sync done: ${fresh} new of ${seen} seen, ${total} stored`);
 }
@@ -1999,6 +2103,7 @@ function xResult(json: unknown, links: string[]): XResult {
 async function xImage(url: string): Promise<Media | null> {
   const res = await fetch(xImageVariant(url, "small"), { headers: { "User-Agent": "Mozilla/5.0" }, signal: AbortSignal.timeout(60_000) });
   if ([403, 404, 410].includes(res.status)) return null; // deleted media: judge from the text alone
+  if (res.status === 429) throw new Fatal("X's image server: HTTP 429 (rate limited); wait a while, then run process again");
   if (!res.ok) throw new Error(`image download failed: HTTP ${res.status}`);
   const data = Buffer.from(await res.arrayBuffer());
   const mime = sniffImage(data);
@@ -2017,7 +2122,7 @@ async function xProcess(o: CommonOptions): Promise<void> {
   const wanted = ["a.tweet_id IS NULL", ...(o.retryErrors ? ["a.status = 'error'"] : []), ...(o.redo ? ["a.status = 'ok'"] : [])];
   const rows = db.query<{ tweet_id: string; raw_json: string }, [number]>(
     `SELECT b.tweet_id, b.raw_json FROM bookmarks b LEFT JOIN analysis a USING (tweet_id) WHERE ${wanted.join(" OR ")}`
-      + " ORDER BY b.sort_index DESC LIMIT ?").all(o.limit || -1);
+      + " ORDER BY b.sort_index DESC LIMIT ?").all(o.limit ?? -1);
   if (!rows.length) return log("nothing to process");
   const model = chooseModel(o);
   const workers = o.workers ?? (model.provider === "openrouter" ? 12 : 4);
@@ -2067,7 +2172,7 @@ function xViewerItem(row: XRow & { raw_json: string }) {
   const own = items(tweet);
   const media = own.length ? own : card?.image ? [{ thumb: card.image, video: false, full: null }] : quote ? items(quote) : [];
   return {
-    id: row.tweet_id, url: row.url, user: row.username, name: xAuthor(tweet).name, date: localDay(row.bookmarked_at),
+    id: row.tweet_id, url: row.url, user: row.username ?? "?", name: xAuthor(tweet).name, date: localDay(row.bookmarked_at),
     intent: row.intent, also: JSON.parse(row.also || "[]"), topic: row.topic, title: row.title, note: row.note,
     link: row.link, linkHost: row.link ? xHost(row.link) : "", text: row.text, media,
     quoted: quote ? { user: xUsername(quote) ?? "", text: xText(quote) } : null,
@@ -2086,7 +2191,7 @@ function xExport(): string[] {
     let text = `- **${mdEscape(row.title)}**`;
     if (row.note) text += `: ${mdEscape(row.note)}`;
     if (row.link) text += ` · [${xHost(row.link)}](${row.link})`;
-    text += ` · [@${row.username}, ${localDay(row.bookmarked_at)}](${row.url})`;
+    text += ` · [@${row.username ?? "?"}, ${localDay(row.bookmarked_at)}](${row.url})`;
     const others = intentsOf(row).filter((i) => i !== intent).map((i) => X_INTENTS[i]?.[0] ?? i);
     return others.length ? `${text} · _also: ${others.join(", ")}_` : text;
   };
@@ -2117,6 +2222,7 @@ function xExport(): string[] {
     written.push(path);
     index.push(`| [${title}](${key}.md) | ${main.length} | ${also.length} |`);
   }
+  removeOldLists(X_OUT, Object.keys(X_INTENTS));
 
   const data = {
     generated: clock(),
@@ -2211,25 +2317,24 @@ async function main(argv: string[]): Promise<void> {
   const { values: v, positionals: [group, command, arg] } = parseArgs({
     args: argv, allowPositionals: true, strict: true,
     options: {
-      full: { type: "boolean" }, "max-pages": { type: "string" }, "min-delay": { type: "string" }, "max-delay": { type: "string" },
+      full: { type: "boolean" }, "max-pages": { type: "string" },
       limit: { type: "string" }, workers: { type: "string" }, "retry-errors": { type: "boolean" }, redo: { type: "boolean" },
       "keep-media": { type: "boolean" }, provider: { type: "string" }, model: { type: "string" },
       browser: { type: "string" }, profile: { type: "string" }, cookies: { type: "string" }, help: { type: "boolean", short: "h" },
     },
   });
-  const number = (name: string, value: string | undefined) => {
+  // Counts are whole numbers of at least 1: a --limit of 0 must never mean "everything".
+  const count = (name: string, value: string | undefined) => {
     if (value === undefined) return undefined;
     const n = Number(value);
-    if (!Number.isFinite(n) || n < 0) throw new Fatal(`--${name} needs a number, got "${value}"`);
+    if (!Number.isInteger(n) || n < 1) throw new Fatal(`--${name} needs a whole number of 1 or more, got "${value}"`);
     return n;
   };
   const o: CommonOptions = {
-    full: v.full, maxPages: number("max-pages", v["max-pages"]), minDelay: number("min-delay", v["min-delay"]),
-    maxDelay: number("max-delay", v["max-delay"]), limit: number("limit", v.limit), workers: number("workers", v.workers),
+    full: v.full, maxPages: count("max-pages", v["max-pages"]), limit: count("limit", v.limit), workers: count("workers", v.workers),
     retryErrors: v["retry-errors"], redo: v.redo, keepMedia: v["keep-media"], provider: v.provider, model: v.model,
     browser: v.browser, profile: v.profile, cookies: v.cookies,
   };
-  if (o.workers === 0) throw new Fatal("--workers must be at least 1");
   if (v.help || !group || group === "help") return console.log(USAGE);
 
   if (group === "login") return login(command);

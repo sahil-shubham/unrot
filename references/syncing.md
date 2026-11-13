@@ -21,6 +21,7 @@
 
 - The first X sync walks every bookmark, about 2 s per 50.
 - The first Instagram sync walks the whole saved feed at 15 to 30 s per page of 50, so 3,000 saves take about 20 minutes.
+- Until one sync has walked to the end of the list, every sync walks all of it, so an interrupted first sync picks up the older saves next time. `status` shows the last full walk.
 - Sorting runs several items at once: 16 workers for Instagram and 12 for X with OpenRouter, 4 with a subscription. About 30 reels a minute with OpenRouter.
 
 Run long jobs detached and check on them with `status`:

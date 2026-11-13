@@ -21,7 +21,7 @@ unrot ig sql "SELECT category, COUNT(*) AS n FROM entries_v GROUP BY category OR
 
 ## Caveats
 
-- Instagram doesn't say when a post was saved. `saved_order` only orders saves (higher means saved later); `taken_at` is when it was posted.
+- Instagram doesn't say when a post was saved. `saved_order` only orders saves (higher means saved later; saving a post again moves it up); `taken_at` is when it was posted.
 - `confidence` is nearly always high, so don't filter on it.
 - Posts with `status` new or error have no entries yet; `unrot ig status` shows how many there are.
 - If a creator deletes a post, its `url` stops working, but the stored caption and summary remain.
