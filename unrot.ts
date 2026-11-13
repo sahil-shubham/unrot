@@ -4,9 +4,9 @@
  *
  *   browser login ─► sync ─► SQLite (raw API JSON) ─► process (one model call per item) ─► export ─► lists/
  *
- * One file for Bun (https://bun.sh), no dependencies; ffmpeg is optional. The model comes from your
- * Claude Pro/Max or ChatGPT (Codex) subscription via OAuth, or from an OpenRouter API key.
- * Run `bun unrot.ts help`.
+ * Runs on Bun (https://bun.sh) with three npm packages pinned in bun.lock; ffmpeg is optional. The model
+ * comes from your Claude Pro/Max or ChatGPT (Codex) subscription via OAuth, or from an OpenRouter API key.
+ * Run `bun install --frozen-lockfile --production` here once, then `bun unrot.ts help`.
  */
 
 import { Database, type SQLQueryBindings } from "bun:sqlite";
@@ -18,6 +18,16 @@ import {
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { parseArgs } from "node:util";
+import { parseHTML } from "linkedom";
+import { ClientTransaction } from "x-client-transaction-id";
+import { z } from "zod";
+
+// Bun's auto-install ignores bun.lock, and a parent project's node_modules (an old zod, say) can shadow
+// these packages, so only run from this folder's own install.
+if (!existsSync(join(import.meta.dir, "node_modules"))) {
+  process.stderr.write(`error: install the packages once: bun install --cwd ${import.meta.dir} --frozen-lockfile --production\n`);
+  process.exit(1);
+}
 
 // ── Default lists. Users tune them in their data folder (about.md, lists.json), never in this file. ──
 
@@ -109,55 +119,40 @@ function loadLists(path: string) {
     process.stderr.write(`error: ${path}: ${message}\n`);
     process.exit(1);
   };
-  let custom: unknown;
+  // Keys become file names and list ids, so keep them plain.
+  const key = z.string().regex(/^[a-z][a-z0-9_]*$/, "keys must be lowercase letters, digits and _");
+  const label = z.string().trim().min(1);
+  const lists = z.record(key, z.tuple([label, label])).refine((r) => Object.keys(r).length > 0, "needs at least one list");
+  const ListsFile = z.object({
+    instagram: z.object({
+      lists: lists.refine((r) => has(r, "other"), 'needs an "other" list for posts that fit nowhere else').optional(),
+      groupByLocation: z.array(z.string()).optional(),
+    }).optional(),
+    x: z.object({
+      intents: lists.optional(),
+      topics: z.record(key, label).refine((r) => Object.keys(r).length > 0, "needs at least one topic").optional(),
+    }).optional(),
+  });
+  let custom: z.infer<typeof ListsFile> = {};
   if (existsSync(path)) {
+    let json: unknown;
     try {
-      custom = JSON.parse(readFileSync(path, "utf8"));
+      json = JSON.parse(readFileSync(path, "utf8"));
     } catch (err) {
       fail(`not valid JSON (${err instanceof Error ? err.message : err})`);
     }
+    const parsed = ListsFile.safeParse(json);
+    custom = parsed.success ? parsed.data : fail(zodIssues(parsed.error));
   }
-  // `keyed`: the keys become file names and list ids, so keep them plain.
-  const object = (value: unknown, what: string, keyed = false): Record<string, unknown> | undefined => {
-    if (value === undefined) return undefined;
-    if (!value || typeof value !== "object" || Array.isArray(value) || !Object.keys(value).length) fail(`${what} must be a non-empty object`);
-    const record = value as Record<string, unknown>; // checked just above
-    for (const key of keyed ? Object.keys(record) : []) {
-      if (!/^[a-z][a-z0-9_]*$/.test(key)) fail(`${what}: key "${key}" must be lowercase letters, digits and _`);
-    }
-    return record;
-  };
-  const lists = (value: unknown, what: string): ListSpec | undefined => {
-    const record = object(value, what, true);
-    if (!record) return undefined;
-    const spec: ListSpec = {};
-    for (const [key, entry] of Object.entries(record)) {
-      if (!Array.isArray(entry) || entry.length !== 2 || entry.some((s) => typeof s !== "string" || !s.trim())) {
-        return fail(`${what}.${key} must be ["Title", "what belongs on it"]`);
-      }
-      spec[key] = [String(entry[0]), String(entry[1])];
-    }
-    return spec;
-  };
-  const root = object(custom, "the file") ?? {};
-  const ig = object(root.instagram, "instagram") ?? {};
-  const x = object(root.x, "x") ?? {};
-  const igLists = lists(ig.lists, "instagram.lists") ?? DEFAULT_IG_LISTS;
-  if (!igLists.other) fail('instagram.lists needs an "other" list for posts that fit nowhere else');
-  const group = ig.groupByLocation ?? DEFAULT_IG_GROUP_BY_LOCATION.filter((key) => igLists[key]);
-  if (!Array.isArray(group) || group.some((key) => typeof key !== "string" || !igLists[key])) {
-    fail("instagram.groupByLocation must be an array of instagram list keys");
-  }
-  const topics: Record<string, string> = {};
-  for (const [key, label] of Object.entries(object(x.topics, "x.topics", true) ?? DEFAULT_X_TOPICS)) {
-    if (typeof label !== "string" || !label.trim()) fail(`x.topics.${key} must be a label`);
-    topics[key] = String(label);
-  }
+  const igLists = custom.instagram?.lists ?? DEFAULT_IG_LISTS;
+  const group = custom.instagram?.groupByLocation ?? DEFAULT_IG_GROUP_BY_LOCATION.filter((k) => has(igLists, k));
+  const unknown = group.filter((k) => !has(igLists, k));
+  if (unknown.length) fail(`instagram.groupByLocation: ${unknown.join(", ")} is not an instagram list`);
   return {
     IG_LISTS: igLists,
-    IG_GROUP_BY_LOCATION: Object.fromEntries((group as string[]).map((key) => [key, true])) as Record<string, true>,
-    X_INTENTS: lists(x.intents, "x.intents") ?? DEFAULT_X_INTENTS,
-    X_TOPICS: topics,
+    IG_GROUP_BY_LOCATION: Object.fromEntries(group.map((k) => [k, true])) as Record<string, true>,
+    X_INTENTS: custom.x?.intents ?? DEFAULT_X_INTENTS,
+    X_TOPICS: custom.x?.topics ?? DEFAULT_X_TOPICS,
   };
 }
 
@@ -188,9 +183,17 @@ function has(record: object, key: unknown): key is string {
   return typeof key === "string" && Object.hasOwn(record, key);
 }
 
-/** A JSON object's fields (none for anything else), for reading model answers before validating them. */
+/** A JSON object's fields (none for anything else), for reading loosely shaped JSON. */
 function fields(value: unknown): Record<string, unknown> {
   return value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : {};
+}
+
+/** A zod error as one line: `path: problem; …`. */
+function zodIssues(error: z.ZodError): string {
+  return error.issues.map((issue) => {
+    const problem = issue.code === "invalid_key" ? issue.issues.map((inner) => inner.message).join(", ") : issue.message;
+    return issue.path.length ? `${issue.path.join(".")}: ${problem}` : problem;
+  }).join("; ");
 }
 
 /** A response body read as `T`. Unchecked: every API shape here keeps its fields optional and is read with `?.`. */
@@ -821,6 +824,19 @@ function rateLimitWait(err: HttpError): number {
   return 0;
 }
 
+/** The JSON Schema sent with a request (without zod's `$schema` URI). */
+function jsonSchema(schema: z.ZodType): object {
+  const { $schema: _, ...rest } = z.toJSONSchema(schema);
+  return rest;
+}
+
+/** A model answer checked against the schema it was asked to follow. */
+function checkAnswer<T extends z.ZodType>(schema: T, json: unknown): z.output<T> {
+  const parsed = schema.safeParse(json);
+  if (!parsed.success) throw new Error(`the answer doesn't fit the schema: ${zodIssues(parsed.error)}`);
+  return parsed.data;
+}
+
 /** One model call with retries for transient failures and answers that fail `validate`. */
 async function askModel<T>(model: Model, req: Ask, validate: (json: unknown) => T): Promise<{ result: T; cost: number | null }> {
   for (let attempt = 1; ; attempt++) {
@@ -1174,34 +1190,24 @@ function igMetadata(m: IgMedia, captions: string): string {
   return lines.join("\n");
 }
 
-const IG_SCHEMA = {
-  type: "object",
-  additionalProperties: false,
-  required: ["summary", "language", "transcript", "on_screen_text", "entries"],
-  properties: {
-    summary: { type: "string" },
-    language: { type: "string" },
-    transcript: { type: "string" },
-    on_screen_text: { type: "string" },
-    entries: {
-      type: "array",
-      items: {
-        type: "object",
-        additionalProperties: false,
-        required: ["category", "title", "kind", "creator", "location", "details", "confidence"],
-        properties: {
-          category: { type: "string", enum: Object.keys(IG_LISTS) },
-          title: { type: "string" },
-          kind: { type: "string" },
-          creator: { type: "string" },
-          location: { type: "string" },
-          details: { type: "string" },
-          confidence: { type: "number" },
-        },
-      },
-    },
-  },
-};
+const igText = z.string().trim();
+/** What the model answers for a saved post. */
+const IgAnswer = z.object({
+  summary: igText,
+  language: igText,
+  transcript: igText,
+  on_screen_text: igText,
+  entries: z.array(z.object({
+    category: z.enum(Object.keys(IG_LISTS)),
+    title: igText,
+    kind: igText,
+    creator: igText,
+    location: igText,
+    details: igText,
+    confidence: z.number(),
+  })),
+});
+const IG_SCHEMA = jsonSchema(IgAnswer);
 
 function igPrompt(m: IgMedia, captions: string, watchesVideo: boolean): string {
   const lists = Object.entries(IG_LISTS).map(([key, [title, desc]]) => `- ${key}: ${title} - ${desc}`).join("\n");
@@ -1251,27 +1257,17 @@ Metadata:
 ${igMetadata(m, captions)}`;
 }
 
-interface IgEntry { category: string; title: string; kind: string; creator: string; location: string; details: string; confidence: number }
-interface IgResult { summary: string; language: string; transcript: string; on_screen_text: string; entries: IgEntry[] }
+type IgResult = z.infer<typeof IgAnswer>;
 
-/** Validates a model answer; the licensed track behind a movie edit or travel clip is not a music pick. */
+/** Checks a model answer; the licensed track behind a movie edit or travel clip is not a music pick. */
 function igResult(json: unknown, m: IgMedia): IgResult {
-  const r = fields(json);
-  const text = (v: unknown) => (typeof v === "string" ? v.trim() : "");
-  let entries: IgEntry[] = (Array.isArray(r.entries) ? r.entries : []).map(fields).filter((e) => text(e.title)).map((e) => ({
-    category: has(IG_LISTS, e.category) ? e.category : "other",
-    title: text(e.title),
-    kind: text(e.kind),
-    creator: text(e.creator),
-    location: text(e.location),
-    details: text(e.details),
-    confidence: Number(e.confidence) || 0,
-  }));
+  const answer = checkAnswer(IgAnswer, json);
+  let entries = answer.entries.filter((e) => e.title);
   const track = fold(m.clips_metadata?.music_info?.music_asset_info?.title ?? "");
   if (track && !entries.every((e) => e.category === "music")) {
     entries = entries.filter((e) => !(e.category === "music" && fold(e.title).includes(track)));
   }
-  return { summary: text(r.summary), language: text(r.language), transcript: text(r.transcript), on_screen_text: text(r.on_screen_text), entries };
+  return { ...answer, entries };
 }
 
 async function igAnalyze(model: Model, m: IgMedia, folder: string, agent: string): Promise<{ result: IgResult; cost: number | null }> {
@@ -1562,103 +1558,6 @@ interface XPage {
   errors?: { message?: string }[];
 }
 
-/** Python's round(): halves go to the even neighbour. */
-function roundHalfEven(x: number): number {
-  const floor = Math.floor(x);
-  const diff = x - floor;
-  return diff > 0.5 ? floor + 1 : diff < 0.5 ? floor : floor % 2 === 0 ? floor : floor + 1;
-}
-
-/**
- * The `x-client-transaction-id` header x.com's web client signs requests with, derived from the
- * homepage's verification key and loading animation. Ported from gallery-dl (after
- * iSarabjitDhiman/XClientTransaction).
- */
-class XTransaction {
-  private constructor(private key: Buffer, private animationKey: string) {}
-
-  static async create(homepage: string): Promise<XTransaction> {
-    const at = homepage.indexOf('name="twitter-site-verification"');
-    const tag = homepage.slice(homepage.lastIndexOf("<", at), homepage.indexOf(">", at));
-    const key = tag.match(/content="([^"]+)"/)?.[1];
-    if (at < 0 || !key) throw new Fatal("x.com homepage has no twitter-site-verification key; the web client changed");
-    let indices: number[] = [];
-    for (const url of chunkUrls(homepage, "ondemand.s")) {
-      const js = await fetch(url).then((r) => (r.ok ? r.text() : ""));
-      indices = [...js.matchAll(/\(\w\[(\d\d?)\],\s*16\)/g)].map((m) => Number(m[1]));
-      if (indices.length) break;
-    }
-    if (!indices.length) throw new Fatal("couldn't find x.com's transaction key indices; the web client changed");
-    const frames = homepage.split('id="loading-x-anim-').slice(1).map((s) => s.slice(0, s.indexOf("</svg>")));
-    const keyBytes = Buffer.from(key, "base64");
-    const frame = frames[keyBytes[5]! % 4];
-    if (!frame) throw new Fatal("x.com homepage has no loading animation frames; the web client changed");
-    const d = frame.slice(frame.indexOf('</path><path d="') + 16);
-    const rows = d.slice(0, d.indexOf('"')).slice(9).split("C").map((p) => p.split(/[^\d]+/).filter(Boolean).map(Number));
-    let frameTime = 1;
-    for (const i of indices.slice(1)) frameTime *= keyBytes[i]! % 16;
-    frameTime = (frameTime / 10 - Math.floor(frameTime / 10) < 0.5 ? Math.floor(frameTime / 10) : Math.ceil(frameTime / 10)) * 10;
-    return new XTransaction(keyBytes, XTransaction.animate(rows[keyBytes[indices[0]!]! % 16]!, frameTime / 4096));
-  }
-
-  static animate(row: number[], t: number): string {
-    const round2 = (x: number) => Number(x.toFixed(2));
-    const scale = (v: number, lo: number, hi: number, floor: boolean) => {
-      const r = (v * (hi - lo)) / 255 + lo;
-      return floor ? Math.floor(r) : round2(r);
-    };
-    const curve = row.slice(7).map((v, i) => scale(v, i % 2 ? -1 : 0, 1, false));
-    const bezier = (a: number, b: number, m: number) => 3 * a * (1 - m) ** 2 * m + 3 * b * (1 - m) * m * m + m ** 3;
-    let c: number;
-    if (t <= 0) {
-      c = (curve[0]! > 0 ? curve[1]! / curve[0]! : curve[1] === 0 && curve[2]! > 0 ? curve[3]! / curve[2]! : 0) * t;
-    } else if (t >= 1) {
-      c = 1 + (curve[2]! < 1 ? (curve[3]! - 1) / (curve[2]! - 1) : curve[2] === 1 && curve[0]! < 1 ? (curve[1]! - 1) / (curve[0]! - 1) : 0) * (t - 1);
-    } else {
-      let lo = 0, hi = 1, mid = 0;
-      c = NaN;
-      while (lo < hi) {
-        mid = (lo + hi) / 2;
-        const estimate = bezier(curve[0]!, curve[2]!, mid);
-        if (Math.abs(t - estimate) < 0.00001) {
-          c = bezier(curve[1]!, curve[3]!, mid);
-          break;
-        }
-        if (estimate < t) lo = mid;
-        else hi = mid;
-      }
-      if (Number.isNaN(c)) c = bezier(curve[1]!, curve[3]!, mid);
-    }
-    const color = [0, 1, 2].map((i) => Math.min(255, Math.max(0, row[i]! * (1 - c) + row[i + 3]! * c)));
-    const radians = (scale(row[6]!, 60, 360, true) * c * Math.PI) / 180;
-    const matrix = [Math.cos(radians), -Math.sin(radians), Math.sin(radians), Math.cos(radians)];
-    const hex = (x: number) => {
-      const whole = Math.trunc(x);
-      let fraction = x - whole;
-      if (!fraction) return whole.toString(16);
-      let out = ".";
-      while (fraction > 0) {
-        fraction *= 16;
-        const digit = Math.trunc(fraction);
-        fraction -= digit;
-        out += digit.toString(16);
-      }
-      return whole.toString(16) + out;
-    };
-    return [...color.map((x) => roundHalfEven(x).toString(16)), ...matrix.map((x) => hex(Math.abs(round2(x)))), "00"]
-      .join("").replace(/[.-]/g, "");
-  }
-
-  id(method: string, path: string): string {
-    const nowf = Date.now() / 1000;
-    const now = Math.floor(nowf) - 1682924400;
-    const time = [now & 0xff, (now >> 8) & 0xff, (now >> 16) & 0xff, (now >> 24) & 0xff];
-    const hash = createHash("sha256").update(`${method}!${path}!${now}obfiowerehiring${this.animationKey}`).digest().subarray(0, 16);
-    const xor = (Math.floor(Math.random() * 16) << 4) + Math.floor((nowf - Math.floor(nowf)) * 16);
-    return Buffer.from([0, ...this.key, ...time, ...hash, 3].map((b) => b ^ xor)).toString("base64").replace(/=+$/, "");
-  }
-}
-
 /** URLs of a named webpack chunk, from the id -> name and id -> hash maps in x.com's homepage. */
 function chunkUrls(homepage: string, name: string): string[] {
   const at = homepage.indexOf(`"${name}"`);
@@ -1685,7 +1584,7 @@ class XClient {
   private headers: Record<string, string>;
   private endpoint = "";
   private features = "";
-  private transaction?: XTransaction;
+  private transaction?: ClientTransaction;
   private resumeAt = 0;
 
   constructor(private session: Session) {
@@ -1731,7 +1630,12 @@ class XClient {
       break;
     }
     if (!this.endpoint) throw new Fatal("couldn't find the Bookmarks operation in x.com's scripts; the web client changed");
-    this.transaction = await XTransaction.create(homepage);
+    // x.com's web client signs API requests with an x-client-transaction-id derived from the homepage.
+    try {
+      this.transaction = await ClientTransaction.create(parseHTML(homepage).document);
+    } catch (err) {
+      throw new Fatal(`couldn't derive x-client-transaction-id (${errorText(err)}); the web client changed`);
+    }
   }
 
   private async page(cursor: string | undefined): Promise<XPage> {
@@ -1748,7 +1652,7 @@ class XClient {
         headers: {
           ...this.headers,
           "x-csrf-token": this.session.cookies.ct0 ?? "",
-          "x-client-transaction-id": this.transaction.id("GET", this.endpoint),
+          "x-client-transaction-id": await this.transaction.generateTransactionId("GET", this.endpoint),
           Cookie: cookieHeader(this.session.cookies),
         },
         signal: AbortSignal.timeout(30_000),
@@ -1959,19 +1863,17 @@ async function xSync(o: CommonOptions): Promise<void> {
   log(`sync done: ${fresh} new of ${seen} seen, ${total} stored`);
 }
 
-const X_SCHEMA = {
-  type: "object",
-  additionalProperties: false,
-  required: ["intent", "also", "topic", "title", "note", "link"],
-  properties: {
-    intent: { type: "string", enum: Object.keys(X_INTENTS) },
-    also: { type: "array", items: { type: "string", enum: Object.keys(X_INTENTS) } },
-    topic: { type: "string", enum: Object.keys(X_TOPICS) },
-    title: { type: "string" },
-    note: { type: "string" },
-    link: { type: "string" },
-  },
-};
+const xIntent = z.enum(Object.keys(X_INTENTS));
+/** What the model answers for a bookmark. */
+const XAnswer = z.object({
+  intent: xIntent,
+  also: z.array(xIntent),
+  topic: z.enum(Object.keys(X_TOPICS)),
+  title: z.string(),
+  note: z.string(),
+  link: z.string(),
+});
+const X_SCHEMA = jsonSchema(XAnswer);
 
 /** The bookmark as prompt text, the images worth attaching, and the links the model may pick from. */
 function xContext(t: Tweet): { metadata: string; images: [label: string, url: string][]; links: string[] } {
@@ -2049,18 +1951,15 @@ Bookmark:
 ${metadata}`;
 }
 
-interface XResult { intent: string; also: string[]; topic: string; title: string; note: string; link: string }
+type XResult = z.infer<typeof XAnswer>;
 
-/** Validates a model answer; `link` must be one of the bookmark's own links. */
+/** Checks a model answer; `link` must be one of the bookmark's own links. */
 function xResult(json: unknown, links: string[]): XResult {
-  const r = fields(json);
-  const intent = r.intent;
-  if (!has(X_INTENTS, intent)) throw new Error(`unknown intent ${JSON.stringify(intent)}`);
-  if (!has(X_TOPICS, r.topic)) throw new Error(`unknown topic ${JSON.stringify(r.topic)}`);
-  const also = [...new Set(Array.isArray(r.also) ? r.also : [])].filter((i) => has(X_INTENTS, i) && i !== intent).slice(0, 2);
-  const [title = "", note = "", link = ""] = [r.title, r.note, r.link].map((v) => squash(typeof v === "string" ? v : ""));
+  const answer = checkAnswer(XAnswer, json);
+  const [title = "", note = "", link = ""] = [answer.title, answer.note, answer.link].map(squash);
   if (!title) throw new Error("model returned no title");
-  return { intent, also, topic: r.topic, title, note, link: links.includes(link) ? link : "" };
+  const also = [...new Set(answer.also)].filter((i) => i !== answer.intent).slice(0, 2);
+  return { intent: answer.intent, also, topic: answer.topic, title, note, link: links.includes(link) ? link : "" };
 }
 
 async function xImage(url: string): Promise<Media | null> {

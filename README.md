@@ -12,7 +12,7 @@ npx skills add sahil-shubham/unrot
 
 Then ask your agent something like "unrot my saved reels" or "what restaurants did I save in Lisbon?". It reads [SKILL.md](SKILL.md) and runs `unrot.ts`.
 
-- **One file.** `unrot.ts` runs on [Bun](https://bun.sh) with no dependencies. ffmpeg is optional.
+- **One script.** `unrot.ts` runs on [Bun](https://bun.sh) with three packages pinned in `bun.lock`: zod, and x-client-transaction-id with linkedom for X. ffmpeg is optional.
 - **Your login, your data.** It uses the instagram.com / x.com session already in your browser. Everything stays in `~/.local/share/unrot`: SQLite, Markdown lists, and an HTML viewer for bookmarks.
 - **Tuned to you.** The agent asks what you save and why, then writes `about.md` and, if you want, your own `lists.json`. Both stay in your data folder, never in the skill.
 

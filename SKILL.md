@@ -7,7 +7,7 @@ description: "Turn the Instagram reels/posts and X (Twitter) bookmarks the user 
 
 Saving a reel or bookmarking a post feels like doing something about it. Then it rots in the saved tab. unrot pulls those saves in, has a model work out why each one was saved, and files them into lists the user can actually act on.
 
-It's one Bun script, `unrot.ts` in this skill's folder, with no dependencies. It uses the user's own browser login, keeps everything in SQLite, and writes the lists as Markdown files.
+It's one Bun script, `unrot.ts` in this skill's folder, plus three npm packages pinned in `bun.lock`: zod, and x-client-transaction-id with linkedom for X. It uses the user's own browser login, keeps everything in SQLite, and writes the lists as Markdown files.
 
 ```
 browser login ─► sync ─► SQLite (raw API JSON) ─► process (1 model call per item) ─► export ─► Markdown lists (+ HTML viewer for X)
@@ -18,10 +18,11 @@ Run every command as `bun <skill-dir>/unrot.ts …`. Below, `unrot` stands for t
 ## Setup (once)
 
 1. **Bun**: check with `bun --version`. If it's missing, install it with `curl -fsSL https://bun.sh/install | bash`.
-2. **Browser login**: the user must be logged into instagram.com and/or x.com in a desktop browser on this machine. Firefox is used when it's installed. Otherwise:
+2. **Packages**: run `bun install --cwd <skill-dir> --frozen-lockfile --production` once, and again after updating the skill. Without it the script stops with that command, or Bun reports "Cannot find package".
+3. **Browser login**: the user must be logged into instagram.com and/or x.com in a desktop browser on this machine. Firefox is used when it's installed. Otherwise:
    - pass `--browser chrome|brave|edge|arc|dia|vivaldi|chromium` (macOS and Linux; macOS asks once for keychain access), or
    - pass `--cookies cookies.txt` (a Netscape cookie export; works anywhere).
-3. **Model access**: usually nothing to do.
+4. **Model access**: usually nothing to do.
    - If the user is logged into a Claude or ChatGPT subscription in **Claude Code, Codex CLI, oh-my-pi or pi**, the script reuses that login. It also reuses `CLAUDE_CODE_OAUTH_TOKEN` (made by `claude setup-token`).
    - Run `unrot models claude` or `unrot models codex` to check. It prints which login it picked.
    - Borrowed logins are only read, never refreshed: a refresh would give the other app a new refresh token and sign it out. They stay fresh as long as the user keeps using that app. If they've all expired, the error names them; have the user open one of those apps once, or use `unrot login`.
@@ -30,7 +31,7 @@ Run every command as `bun <skill-dir>/unrot.ts …`. Below, `unrot` stands for t
    If there's no login to reuse, use one of these:
    - `unrot login claude` (Claude Pro/Max) or `unrot login codex` (ChatGPT Plus/Pro/Business). It opens a browser for OAuth and waits for the redirect, so **ask the user to run it in their own terminal**. On a remote machine they can approve in any browser and paste the URL it lands on. Tokens go to `~/.local/share/unrot/auth.json` (mode 600) and refresh automatically.
    - `OPENROUTER_API_KEY=...` in `~/.local/share/unrot/.env`: pay per use, about $0.0025 per reel and $0.0002 per bookmark.
-4. **ffmpeg** (optional, `brew install ffmpeg`): with Claude or Codex, each reel's video is sent as 8 frames. Without ffmpeg, only its cover image is sent.
+5. **ffmpeg** (optional, `brew install ffmpeg`): with Claude or Codex, each reel's video is sent as 8 frames. Without ffmpeg, only its cover image is sent.
 
 ## Tune it to the person (before the first `process`)
 
@@ -125,4 +126,4 @@ Other `.env` keys: `UNROT_PROVIDER`, `UNROT_MODEL`, `UNROT_BROWSER`.
 - "session expired" or a login redirect means the user has to log in again in that browser.
 - "media URL expired" means the Instagram CDN links went stale (they last about a day after a sync). Run `unrot ig sync --full`, then `unrot ig process --retry-errors`.
 - Downloaded media is deleted after each post is analysed unless you pass `--keep-media`. A video is about 7 MB.
-- "the web client changed" from X means x.com's page layout changed underneath the script, and `unrot.ts` needs updating.
+- "the web client changed" from X means x.com changed its web client underneath the script, and `unrot.ts` or its x-client-transaction-id package needs updating.

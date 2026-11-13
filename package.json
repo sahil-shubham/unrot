@@ -1,0 +1,17 @@
+{
+  "name": "unrot",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "check": "tsc"
+  },
+  "dependencies": {
+    "linkedom": "0.18.15",
+    "x-client-transaction-id": "0.3.3",
+    "zod": "4.6.7"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "typescript": "latest"
+  }
+}
