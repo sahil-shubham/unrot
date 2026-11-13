@@ -221,6 +221,34 @@ function openDb(path: string, schema: string): Database {
   return db;
 }
 
+const SQL_MAX_ROWS = 200;
+
+/**
+ * Prints a read-only query's rows as JSON, one object per line, so answering questions needs no sqlite3
+ * CLI. Stops after SQL_MAX_ROWS rows to keep the output readable; LIMIT and OFFSET page through the rest.
+ */
+function sqlQuery(path: string, sql: string): void {
+  if (!existsSync(path)) throw new Fatal(`no database at ${path} yet; run sync first`);
+  // safeIntegers: X's sort_index is above 2^53; those values print as strings instead of losing digits.
+  const db = new Database(path, { readonly: true, safeIntegers: true });
+  const json = (_key: string, value: unknown) =>
+    typeof value === "bigint" ? (Number.isSafeInteger(Number(value)) ? Number(value) : String(value)) : value;
+  let rows = 0;
+  try {
+    for (const row of db.query(sql).iterate()) {
+      if (rows === SQL_MAX_ROWS) {
+        log(`stopped after ${SQL_MAX_ROWS} rows; add LIMIT and OFFSET to see the rest`);
+        break;
+      }
+      console.log(JSON.stringify(row, json));
+      rows++;
+    }
+  } catch (err) {
+    throw new Fatal(`SQL: ${err instanceof Error ? err.message : err}`);
+  }
+  if (!rows) log("no rows");
+}
+
 async function run(cmd: string[]): Promise<void> {
   const proc = Bun.spawn(cmd, { stdout: "ignore", stderr: "pipe" });
   if (await proc.exited) throw new Error(`${cmd[0]} failed: ${(await new Response(proc.stderr).text()).trim().slice(0, 300)}`);
@@ -2153,6 +2181,7 @@ Commands (ig and x):
                      --keep-media        ig only: keep downloaded media (default: deleted after analysis)
   export           rewrite the lists (ig: Markdown; x: Markdown + bookmarks.html)
   status           counts, models, spend, recent errors
+  sql "SELECT …"   read-only query; prints rows as JSON lines (at most ${SQL_MAX_ROWS}; use LIMIT/OFFSET)
   cookies-export FILE   write the site's cookies as cookies.txt, to run elsewhere with --cookies
 
 Browser session (sync):
@@ -2225,6 +2254,9 @@ async function main(argv: string[]): Promise<void> {
       await processItems(o);
       return exportLists();
     case "status": return source === "ig" ? igStatus() : xStatus();
+    case "sql":
+      if (!arg) throw new Fatal(`usage: bun unrot.ts ${source} sql "SELECT …"`);
+      return sqlQuery(source === "ig" ? IG_DB : X_DB, arg);
     case "cookies-export": {
       if (!arg) throw new Fatal(`usage: bun unrot.ts ${source} cookies-export FILE`);
       const domain = source === "ig" ? "instagram.com" : "x.com";

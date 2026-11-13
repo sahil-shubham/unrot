@@ -69,6 +69,7 @@ Changing lists after a full run means running `unrot <ig|x> process --redo` and 
 | `unrot <ig\|x> export` | rewrite the lists from the database |
 | `unrot models <claude\|codex>` | models the subscription can use, and which login is used |
 | `unrot lists` | the lists in use (defaults plus the user's `lists.json`), as JSON |
+| `unrot <ig\|x> sql "SELECT …"` | read-only query on that site's database; one JSON object per row, at most 200 rows |
 | `unrot <ig\|x> cookies-export FILE` | write cookies.txt, to run on another machine with `--cookies FILE` |
 
 A normal Instagram sync stops at the first page it already has; a normal X sync stops after 50 known bookmarks in a row.
@@ -96,14 +97,13 @@ Only OpenRouter models that take video, like the default, hear a reel's speech. 
 - `x/lists/bookmarks.html`: a viewer with a tab per reason, topic chips, search and "mark done".
 - `x/lists/*.md`: one file per reason.
 
-The databases are the source of truth; the lists are regenerated from them. Answer questions with `sqlite3`:
+The databases are the source of truth; the lists are regenerated from them. Answer questions with `unrot <ig|x> sql`. It opens the database read-only, prints one JSON object per row, and stops after 200 rows; page with `LIMIT`/`OFFSET`. To see the tables and views, query `SELECT name, sql FROM sqlite_master`.
 
 ```sh
-cd ~/.local/share/unrot
-sqlite3 -header -column instagram/reels.db "SELECT title, location, url FROM entries_v WHERE category='food' AND location LIKE '%Lisbon%'"
+unrot ig sql "SELECT title, location, url FROM entries_v WHERE category = 'food' AND location LIKE '%Lisbon%'"
 # "that reel about X": search what was said, shown and written
-sqlite3 instagram/reels.db "SELECT m.url, a.summary FROM media m JOIN analysis a USING (code) WHERE a.transcript LIKE '%sourdough%' OR a.on_screen_text LIKE '%sourdough%' OR m.caption LIKE '%sourdough%'"
-sqlite3 -header -column x/bookmarks.db "SELECT title, note, link, url FROM bookmarks_v WHERE intent='design' OR also LIKE '%\"design\"%' ORDER BY sort_index DESC LIMIT 20"
+unrot ig sql "SELECT m.url, a.summary FROM media m JOIN analysis a USING (code) WHERE a.transcript LIKE '%sourdough%' OR a.on_screen_text LIKE '%sourdough%' OR m.caption LIKE '%sourdough%'"
+unrot x sql "SELECT title, note, link, url FROM bookmarks_v WHERE intent = 'design' OR also LIKE '%\"design\"%' ORDER BY sort_index DESC LIMIT 20"
 ```
 
 List keys are whatever `unrot lists` shows. The defaults:
